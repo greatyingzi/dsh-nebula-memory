@@ -30,7 +30,8 @@
  * profile does not re-expose them); set DSH_ROOT to override the probe order.
  *
  * Everything degrades silently: recall and tools return soft errors and never
- * block a turn longer than their own budget.
+ * block a turn longer than their own budget. (v1.1.0: writes go through the
+ * durable outbox — see the Write outbox section.)
  */
 
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises';
@@ -489,7 +490,7 @@ async function outboxFlushIndividual(entries) {
   }
 }
 
-async function outboxFlush() {
+async function outboxFlush(force = false) {
   if (outboxFlushing) return;
   await outboxEnsureLoaded();
   if (outbox.size === 0) return;
@@ -504,7 +505,7 @@ async function outboxFlush() {
   }
   if (removed) outboxPersist();
   const due = [...outbox.values()]
-    .filter((e) => e.next_at <= now)
+    .filter((e) => force || e.next_at <= now)
     .sort((a, b) => a.created_at - b.created_at)
     .slice(0, OUTBOX_BATCH);
   if (due.length === 0) return;
@@ -770,7 +771,7 @@ const nebulaOutboxTool = {
   async execute(args) {
     const action = args?.action === 'flush' ? 'flush' : 'status';
     await outboxEnsureLoaded();
-    if (action === 'flush') await outboxFlush();
+    if (action === 'flush') await outboxFlush(true); // 手动冲刷无视退避, 立即尝试
     const now = Date.now();
     const entries = [...outbox.values()];
     const dueAt = entries.length ? Math.min(...entries.map((e) => Math.max(e.next_at, now))) : undefined;
