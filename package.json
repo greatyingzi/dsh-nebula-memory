@@ -1,6 +1,6 @@
 {
   "name": "@local/nebula-memory",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "知识星云 (Nebula) memory for DSH: tools + automatic recall injection.",

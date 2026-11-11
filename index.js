@@ -33,7 +33,7 @@
  * block a turn longer than their own budget.
  */
 
-import { readFile } from 'node:fs/promises';
+import { appendFile, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 // ---------------------------------------------------------------------------
@@ -87,6 +87,19 @@ const PREFETCH_STALE_MS = 30_000;     // discard recall older than this
 const CONFIG_TTL_MS = 60_000;         // re-read device config at most once a minute
 const TOKEN_REFRESH_MS = 10 * 60_000;
 
+// --- write outbox (异步上传 + 失败重试 + 容量控制) ---
+const OUTBOX_MAX_ENTRIES = 200;              // 队列容量上限, 超出淘汰最旧并记入 dropped
+const OUTBOX_MAX_ATTEMPTS = 30;              // 单条最大尝试次数, 超过丢弃
+const OUTBOX_TTL_MS = 7 * 24 * 3600_000;     // 单条最长滞留 7 天
+const OUTBOX_TICK_MS = 30_000;               // 后台重试节拍
+const OUTBOX_STARTUP_FLUSH_DELAY = 15_000;   // 进程/会话启动后首试延迟
+const OUTBOX_KICK_DELAY_MS = 1_500;          // 入队后首发延迟(在线时秒级送达)
+const OUTBOX_BACKOFF_BASE_MS = 30_000;       // 退避基数: 30s, 60s, 120s ... 封顶 30min
+const OUTBOX_BACKOFF_CAP_MS = 30 * 60_000;
+const OUTBOX_BATCH = 10;                     // 每拍批量补传条数 (/api/memories/batch)
+const OUTBOX_RECENT_KEYS = 100;              // 已送达 key 的近期去重集容量
+const OUTBOX_DROPPED_KEEP_LINES = 200;       // dropped 审计文件保留行数
+
 const UNCONFIGURED_HINT =
   '星云未配置：设置环境变量 NEBULA_BASE_URL，或创建 ~/.dsh/nebula-memory.json 写入 ' +
   '{"base_url":"http://<星云主机>:9200","fallback_url":"<备用地址>","token":"<64位hex>"}' +
@@ -123,6 +136,14 @@ function extractText(content) {
     .map((b) => b.text)
     .join('\n')
     .trim();
+}
+
+function hashOf(text) {
+  let h = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    h = (h * 31 + text.charCodeAt(i)) | 0;
+  }
+  return `${(h >>> 0).toString(16)}${text.length.toString(16)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +335,246 @@ async function nebulaApi(method, path, data, totalBudgetMs) {
 }
 
 // ---------------------------------------------------------------------------
+// Write outbox — 写入永不失败: 入队即返回, 后台批量补传, 本地 JSONL 固化
+//
+// 存储:  $DSH_HOME/nebula-memory.outbox.jsonl (一行一条, 崩溃容错: 断尾行忽略)
+// 时序:  入队后 1.5s 首发; 进程启动 15s 后首试; 之后每 30s 一拍; 失败按
+//        30s→60s→…→30min 指数退避; 批量走 /api/memories/batch(404 时逐条)
+// 容量:  去重键 content+scope+tags; 上限 200 条(超出淘汰最旧); 单条最多 30 次
+//        尝试或滞留 7 天即丢入 *.dropped 审计文件(保留 200 行)
+// ---------------------------------------------------------------------------
+
+const outbox = new Map();        // key -> entry (保持插入序 = FIFO)
+const outboxRecent = new Set();  // 近期已送达 key, 防止同一结论反复入队
+let outboxLoaded = false;
+let outboxLoadPromise = null;
+let outboxTimer = null;
+let outboxKickTimer = null;
+let outboxFlushing = false;
+let outboxDroppedTotal = 0;
+let outboxLastError = '';
+
+function outboxPath() {
+  return join(dshHome(), 'nebula-memory.outbox.jsonl');
+}
+
+function outboxDroppedPath() {
+  return `${outboxPath()}.dropped`;
+}
+
+function outboxKeyOf(content, scope, tags) {
+  return hashOf(`${content}\u0000${scope || ''}\u0000${tags || ''}`);
+}
+
+async function outboxEnsureLoaded() {
+  if (outboxLoaded) return;
+  if (!outboxLoadPromise) {
+    outboxLoadPromise = (async () => {
+      const text = await readFile(outboxPath(), 'utf8').catch(() => '');
+      for (const line of text.split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const entry = JSON.parse(t);
+          if (entry && entry.op === 'add' && typeof entry.content === 'string' && entry.key) {
+            outbox.delete(entry.key); // 同 key 后行覆盖前行
+            outbox.set(entry.key, entry);
+          }
+        } catch {
+          break; // 崩溃断尾: 其后内容忽略, 下次 persist 重写修复
+        }
+      }
+      outboxLoaded = true;
+    })();
+  }
+  await outboxLoadPromise;
+}
+
+function outboxPersist() {
+  const entries = [...outbox.values()];
+  const tmp = `${outboxPath()}.tmp`;
+  const data = entries.map((e) => JSON.stringify(e)).join('\n') + (entries.length ? '\n' : '');
+  return writeFile(tmp, data)
+    .then(() => rename(tmp, outboxPath()))
+    .catch((error) => {
+      outboxLastError = `persist: ${error instanceof Error ? error.message : String(error)}`;
+    });
+}
+
+function outboxDropRecord(entry, reason) {
+  outboxDroppedTotal += 1;
+  const line = `${JSON.stringify({ dropped_at: Date.now(), reason, ...entry })}\n`;
+  appendFile(outboxDroppedPath(), line).catch(() => {});
+  readFile(outboxDroppedPath(), 'utf8')
+    .then((text) => {
+      const lines = text.split('\n').filter(Boolean);
+      if (lines.length > OUTBOX_DROPPED_KEEP_LINES) {
+        return writeFile(outboxDroppedPath(), `${lines.slice(-OUTBOX_DROPPED_KEEP_LINES).join('\n')}\n`);
+      }
+    })
+    .catch(() => {});
+  try {
+    console.warn(`[nebula-memory] outbox drop(${reason}): ${truncate(entry.content, 80)}`);
+  } catch {}
+}
+
+function outboxBackoff(attempts) {
+  return Math.min(OUTBOX_BACKOFF_BASE_MS * 2 ** Math.max(0, attempts - 1), OUTBOX_BACKOFF_CAP_MS);
+}
+
+function outboxRecentAdd(key) {
+  outboxRecent.add(key);
+  if (outboxRecent.size > OUTBOX_RECENT_KEYS) {
+    outboxRecent.delete(outboxRecent.values().next().value);
+  }
+}
+
+function outboxFail(entries, error) {
+  const at = Date.now();
+  for (const entry of entries) {
+    entry.attempts += 1;
+    entry.next_at = at + outboxBackoff(entry.attempts);
+    entry.last_error = String(error).slice(0, 200);
+  }
+  outboxLastError = String(error).slice(0, 200);
+}
+
+async function outboxEnqueue({ content, scope, tags }) {
+  await outboxEnsureLoaded();
+  const key = outboxKeyOf(content, scope, tags);
+  if (outbox.has(key)) return { key, duplicate: 'pending' };
+  if (outboxRecent.has(key)) return { key, duplicate: 'delivered' };
+  let evicted = false;
+  while (outbox.size >= OUTBOX_MAX_ENTRIES) {
+    const oldest = outbox.keys().next().value;
+    outboxDropRecord(outbox.get(oldest), 'capacity');
+    outbox.delete(oldest);
+    evicted = true;
+  }
+  const entry = {
+    op: 'add',
+    key,
+    content,
+    scope: scope || '',
+    tags: tags || '',
+    created_at: Date.now(),
+    attempts: 0,
+    next_at: 0,
+  };
+  outbox.set(key, entry);
+  await appendFile(outboxPath(), `${JSON.stringify(entry)}\n`).catch((error) => {
+    outboxLastError = `append: ${error instanceof Error ? error.message : String(error)}`;
+  });
+  if (evicted) outboxPersist();
+  outboxKick();
+  return { key, duplicate: null };
+}
+
+async function outboxFlushIndividual(entries) {
+  for (const entry of entries) {
+    const body = {
+      content: entry.content,
+      ...(entry.scope ? { scope: entry.scope } : {}),
+      ...(entry.tags ? { tags: entry.tags } : {}),
+    };
+    const res = await nebulaApi('POST', '/api/memories', body, BUDGET_WRITE_MS);
+    if (res.json && (res.json.ok === true || res.status === 200 || res.status === 201)) {
+      outbox.delete(entry.key);
+      outboxRecentAdd(entry.key);
+      outboxPersist();
+    } else {
+      outboxFail([entry], res.json?.error || res.error || `HTTP ${res.status}`);
+      return; // 一条失败即停, 整体退避
+    }
+  }
+}
+
+async function outboxFlush() {
+  if (outboxFlushing) return;
+  await outboxEnsureLoaded();
+  if (outbox.size === 0) return;
+  const now = Date.now();
+  let removed = false;
+  for (const [key, entry] of [...outbox]) {
+    if (now - entry.created_at >= OUTBOX_TTL_MS || entry.attempts >= OUTBOX_MAX_ATTEMPTS) {
+      outboxDropRecord(entry, entry.attempts >= OUTBOX_MAX_ATTEMPTS ? 'max-attempts' : 'ttl');
+      outbox.delete(key);
+      removed = true;
+    }
+  }
+  if (removed) outboxPersist();
+  const due = [...outbox.values()]
+    .filter((e) => e.next_at <= now)
+    .sort((a, b) => a.created_at - b.created_at)
+    .slice(0, OUTBOX_BATCH);
+  if (due.length === 0) return;
+  const routes = await loadRoutes();
+  if (routes.length === 0 || routes.every((b) => (routeFails.get(b) || 0) > Date.now())) {
+    return; // 未配置或全部路由冷却中: 不试也不计 attempts
+  }
+  outboxFlushing = true;
+  try {
+    const items = due.map((e) => ({
+      content: e.content,
+      ...(e.scope ? { scope: e.scope } : {}),
+      ...(e.tags ? { tags: e.tags } : {}),
+    }));
+    const res = await nebulaApi('POST', '/api/memories/batch', { items }, BUDGET_WRITE_MS);
+    const body = res.json;
+    if (res.status === 404) {
+      await outboxFlushIndividual(due); // 老后端无批量端点: 逐条
+      return;
+    }
+    if (!body || body.ok !== true || !Array.isArray(body.results)) {
+      outboxFail(due, body?.error || res.error || `HTTP ${res.status}`);
+      outboxPersist(); // 失败状态也落盘, 崩溃重启不丢尝试计数
+      return;
+    }
+    const byIndex = new Map(body.results.map((r) => [Number(r.index), r]));
+    let delivered = false;
+    due.forEach((entry, i) => {
+      const r = byIndex.get(i);
+      if (r && r.status !== 'error') {
+        outbox.delete(entry.key);
+        outboxRecentAdd(entry.key);
+        delivered = true;
+      } else {
+        outboxFail([entry], r?.message || 'batch item error');
+      }
+    });
+    if (delivered) outboxPersist();
+  } finally {
+    outboxFlushing = false;
+  }
+}
+
+function outboxSchedule(delayMs) {
+  if (outboxTimer) clearTimeout(outboxTimer);
+  outboxTimer = setTimeout(() => {
+    outboxTimer = null;
+    outboxFlush().catch((error) => {
+      outboxLastError = String(error?.message || error);
+    });
+    outboxSchedule(OUTBOX_TICK_MS);
+  }, delayMs);
+}
+
+function outboxKick() {
+  if (outboxKickTimer) return;
+  outboxKickTimer = setTimeout(() => {
+    outboxKickTimer = null;
+    outboxFlush().catch(() => {});
+  }, OUTBOX_KICK_DELAY_MS);
+}
+
+function outboxStop() {
+  if (outboxTimer) clearTimeout(outboxTimer);
+  if (outboxKickTimer) clearTimeout(outboxKickTimer);
+  outboxTimer = null;
+  outboxKickTimer = null;
+}
+
+// ---------------------------------------------------------------------------
 // Tools (plain ToolDefinition objects; explicit JSON Schema)
 // ---------------------------------------------------------------------------
 
@@ -406,6 +667,8 @@ const nebulaAddTool = {
   name: 'nebula_add',
   description:
     '往知识星云写入一条长期记忆（跨设备共享，其他设备上的 agent 也能检索到）。' +
+    '写入是异步入队制：本工具立即返回成功并把内容放进本地上传队列，由后台自动补传到星云——' +
+    '服务端抖动/掉线也绝不丢失、不阻塞、不报错，恢复后自动送达。' +
     '只在用户明确要求记住/保存某条结论，或本轮产生了“删了它下次就要从零重做”的根因/硬约束/决策+理由时使用；' +
     'content 必须写成自含结论，不要引用只有本机才能打开的文件路径。',
   parameters: {
@@ -418,45 +681,109 @@ const nebulaAddTool = {
     },
     required: ['content'],
   },
-  timeoutMs: 20_000,
+  timeoutMs: 10_000,
   output: {
     schema: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        ok: { type: 'boolean', description: 'Whether the memory was written.' },
+        ok: { type: 'boolean', description: 'Whether the memory was accepted into the upload queue.' },
+        queued: { type: 'boolean', description: 'Always true: delivery to nebula happens in the background.' },
+        pending: { type: 'integer', description: 'Entries currently waiting in the local outbox.' },
+        duplicate: { type: 'string', description: 'Why an identical entry was skipped: pending or delivered.' },
         error: { type: 'string' },
-        id: { type: 'string' },
-        status: { type: 'string' },
       },
-      required: ['ok'],
+      required: ['ok', 'queued'],
     },
     render: (_args, value) => [{
       type: 'text',
-      text: value.ok
-        ? `已写入星云（id ${value.id}${value.status ? `，${value.status}` : ''}）`
-        : `写入失败：${value.error || '未知错误'}`,
+      text: value.duplicate
+        ? `相同内容已在队列/近期已送达，未重复入队（待发 ${value.pending} 条）`
+        : `已入队，后台自动写入星云（当前待发 ${value.pending ?? 1} 条；断网也会在恢复后补传）`,
     }],
   },
   async execute(args) {
     const content = String(args?.content || '').trim();
     if (!content) return { ok: false, error: 'content 不能为空' };
     const device = await loadDeviceConfig();
-    const body = {
-      content: content.slice(0, 8000),
-      ...(args?.scope ? { scope: String(args.scope) } : device.scope ? { scope: device.scope } : {}),
-      ...(args?.tags ? { tags: String(args.tags) } : {}),
-    };
-    const res = await nebulaApi('POST', '/api/memories', body, BUDGET_WRITE_MS);
-    const out = res.json;
-    if (res.status >= 500 || !out) {
-      return { ok: false, error: out?.error || res.error || `HTTP ${res.status}` };
+    const scope = args?.scope ? String(args.scope) : device.scope || '';
+    const tags = args?.tags ? String(args.tags) : '';
+    try {
+      const result = await outboxEnqueue({ content: content.slice(0, 8000), scope, tags });
+      return {
+        ok: true,
+        queued: true,
+        pending: outbox.size,
+        ...(result.duplicate ? { duplicate: result.duplicate } : {}),
+      };
+    } catch (error) {
+      // 队列本身异常也要兜住: 不向 agent 报失败
+      return { ok: true, queued: true, pending: -1, error: `queue: ${error instanceof Error ? error.message : String(error)}` };
     }
+  },
+};
+
+const nebulaOutboxTool = {
+  name: 'nebula_outbox',
+  description:
+    '查看或手动冲刷星云写入队列。写入走异步队列（本地 JSONL 固化，断网自动重试补传）；' +
+    '本工具用于确认待发条数/重试计划，或在需要时立即尝试上传。',
+  parameters: {
+    type: 'object',
+    additionalProperties: true,
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['status', 'flush'],
+        description: 'status=只看待发与重试计划（默认）；flush=立即尝试上传一批。',
+      },
+    },
+  },
+  timeoutMs: 20_000,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean' },
+        action: { type: 'string' },
+        pending: { type: 'integer' },
+        attempts: { type: 'integer', description: 'Max retry count among pending entries.' },
+        next_retry_s: { type: 'integer', description: 'Seconds until the oldest due entry retries; absent when idle.' },
+        oldest_age_s: { type: 'integer' },
+        dropped_total: { type: 'integer' },
+        last_error: { type: 'string' },
+        file: { type: 'string' },
+      },
+      required: ['ok', 'action', 'pending'],
+    },
+    render: (_args, value) => [{
+      type: 'text',
+      text: value.pending === 0
+        ? '队列为空（全部已送达星云）'
+        : `待发 ${value.pending} 条${value.attempts ? `，最多已重试 ${value.attempts} 次` : ''}${value.oldest_age_s !== undefined ? `，最老已等 ${value.oldest_age_s}s` : ''}` +
+          `${value.next_retry_s !== undefined ? `，下次重试 ${value.next_retry_s}s 后` : ''}` +
+          `${value.last_error ? `；上次错误: ${value.last_error}` : ''}` +
+          `（累计丢弃 ${value.dropped_total ?? 0}；队列文件 ${value.file}）`,
+    }],
+  },
+  async execute(args) {
+    const action = args?.action === 'flush' ? 'flush' : 'status';
+    await outboxEnsureLoaded();
+    if (action === 'flush') await outboxFlush();
+    const now = Date.now();
+    const entries = [...outbox.values()];
+    const dueAt = entries.length ? Math.min(...entries.map((e) => Math.max(e.next_at, now))) : undefined;
     return {
-      ok: out.ok === true || res.status === 200 || res.status === 201,
-      ...(out.id ? { id: String(out.id) } : {}),
-      ...(out.status ? { status: String(out.status) } : {}),
-      ...(!out.ok && out.error ? { error: String(out.error) } : {}),
+      ok: true,
+      action,
+      pending: entries.length,
+      ...(entries.length ? { attempts: Math.max(...entries.map((e) => e.attempts || 0)) } : {}),
+      ...(entries.length && dueAt !== undefined && dueAt > now ? { next_retry_s: Math.round((dueAt - now) / 1000) } : {}),
+      ...(entries.length ? { oldest_age_s: Math.round((now - Math.min(...entries.map((e) => e.created_at))) / 1000) } : {}),
+      dropped_total: outboxDroppedTotal,
+      ...(outboxLastError ? { last_error: outboxLastError } : {}),
+      file: outboxPath(),
     };
   },
 };
@@ -617,6 +944,7 @@ export function apply(ctx) {
       scope.tools.register(nebulaSearchTool);
       scope.tools.register(nebulaAddTool);
       scope.tools.register(nebulaStatsTool);
+      scope.tools.register(nebulaOutboxTool);
     });
 
     const offCreated = ctx.on('agent/created', ({ agent }) => {
@@ -631,12 +959,16 @@ export function apply(ctx) {
     });
     for (const agent of ctx.agents.list()) attachAgent(agent);
 
+    // 写入队列: 启动 15s 后首试, 之后每 30s 一拍; 卸载时停表
+    outboxSchedule(OUTBOX_STARTUP_FLUSH_DELAY);
+
     return () => {
       offCreated?.();
       offDisposed?.();
       for (const dispose of agentDisposers.values()) dispose();
       agentDisposers.clear();
       pendingByAgent.clear();
+      outboxStop();
       toolsFiber?.dispose?.();
     };
   }, 'nebula-memory: tools & recall');
