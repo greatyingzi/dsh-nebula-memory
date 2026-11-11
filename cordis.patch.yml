@@ -1,0 +1,4 @@
+- insert:
+    - id: nebula-memory
+      name: '@local/nebula-memory'
+      config: {}

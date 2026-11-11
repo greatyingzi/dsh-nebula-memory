@@ -1,0 +1,36 @@
+{
+  "name": "@local/nebula-memory",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "知识星云 (Nebula) memory for DSH: tools + automatic recall injection.",
+  "license": "MIT",
+  "author": "greatyingzi",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "nebula",
+    "memory",
+    "rag"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/greatyingzi/dsh-nebula-memory.git"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
