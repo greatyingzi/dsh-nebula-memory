@@ -2,8 +2,8 @@
 
 把私有知识星云（Nebula，SQLite + FAISS + BGE-M3 自建 RAG 知识库）接入 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness)。
 
-- **自动召回**：每条真实用户消息进会话即在星云语义检索，相关记忆（余弦 ≥0.72，top-3）在下一 step 边界自动拼进上下文——不打工具、零操作，模型直接"记得"跨设备历史结论。注入块标记 `[星云记忆自动召回]`，源 `{kind:'nebula', form:'recall'}`，可从会话日志追溯。
-- **手动工具**：`nebula_search`（RRF+rerank 融合检索）/ `nebula_add`（**异步入队，永不失败**）/ `nebula_stats`（健康规模）/ `nebula_outbox`（队列管理）。
+- **自动召回**：每条真实用户消息进会话即在星云语义检索，相关记忆（余弦 ≥0.72，top-3）+ **会话指针行**（RRF 融合，top-2）在下一 step 边界自动拼进上下文——不打工具、零操作，模型直接"记得"跨设备历史结论。注入块标记 `[星云记忆自动召回]`，源 `{kind:'nebula', form:'recall'}`，可从会话日志追溯。
+- **手动工具**：`nebula_search`（RRF+rerank 融合检索）/ `nebula_session_search`（四端历史会话切段检索）/ `nebula_session_read`（按 session_id 下钻整段会话）/ `nebula_add`（**异步入队，永不失败**）/ `nebula_stats`（健康规模）/ `nebula_outbox`（队列管理）。
 - **写入队列**：断网/抖动时写入先固化本地 JSONL，后台批量补传，指数退避，容量受控（详见 [CHANGELOG v1.1.0](CHANGELOG.md)）。
 - **多路由 failover**：主+备地址，失败冷却 30s、按实测延迟排序、总预算内快速失败。
 - **零内嵌端点**：包内无任何 IP/域名/token，**每台设备装后自配**。

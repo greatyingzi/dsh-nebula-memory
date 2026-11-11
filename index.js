@@ -121,6 +121,17 @@ const PREFETCH_ENTRY_CHARS = 300;     // truncate each entry
 const PREFETCH_WAIT_MS = 3500;        // max extra wait at pre-step for a slow recall
 const PREFETCH_STALE_MS = 30_000;     // discard recall older than this
 
+// --- session-RAG 指针腿 (会话段索引, 对齐 hermes MEM_INTERACTION §3.1) ---
+// 与 mem 腿并行、独立预算、失败静默; RRF(k=60) 排名融合取 session 侧 top-N,
+// 只注入"指针行"(时间/主题/设备 + session_id), 不注原文——原文经指针下钻。
+// 选法用 RRF 排名而非硬阈值: 实测 0.75 阈值 session 召回仅 0.33, RRF 达 0.82。
+const PREFETCH_SESSION_ENABLED = true;
+const PREFETCH_SESSION_LIMIT = 2;     // max pointer lines per turn
+const PREFETCH_SESSION_FETCH = 8;     // candidates fetched from the session index
+const PREFETCH_SESSION_BUDGET_MS = 2000; // independent budget for the session leg
+const PREFETCH_SESSION_PREVIEW = 300; // preview chars fetched for pointer building
+const SESSION_SEARCH_TOOL_PREVIEW = 1500; // 下钻工具的正文预览长度
+
 const CONFIG_TTL_MS = 60_000;         // re-read device config at most once a minute
 const TOKEN_REFRESH_MS = 10 * 60_000;
 
@@ -825,6 +836,170 @@ const nebulaOutboxTool = {
   },
 };
 
+const nebulaSessionSearchTool = {
+  name: 'nebula_session_search',
+  description:
+    '在会话 RAG 库检索历史会话原文片段——四端(Hermes/Claude Code/Codex/pi 等)的历史对话都已切段入库。' +
+    '当上下文出现「📂 会话: … [session_id]」指针行需要看原文, 或要查"以前那次是怎么做的/当时结论"时调用。' +
+    '要查根因/硬约束等结论性知识用 nebula_search（经验优先），本工具查的是历史对话原文。',
+  parameters: {
+    type: 'object',
+    additionalProperties: true,
+    properties: {
+      query: {
+        type: 'string',
+        description:
+          '尽量详细的自然语言描述：主题+现象/场景+技术细节(组件/模型/文件/报错)+因果或结论指向；' +
+          '别只甩关键词——细节越多命中越准，只给名词会退化成关键字匹配、混入高频词假阳。',
+      },
+      limit: { type: 'integer', description: '返回段数，默认 6，最大 20。' },
+      device: { type: 'string', description: '限定设备，例如 liheng-mac / viture / leon-pc / lenovo-book；不传则全库。' },
+      agent: { type: 'string', description: '限定 agent 来源，例如 hermes / claude / codex / pi；不传则全库。' },
+    },
+    required: ['query'],
+  },
+  timeoutMs: 20_000,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean' },
+        error: { type: 'string' },
+        total: { type: 'integer' },
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              session_id: { type: 'string' },
+              agent: { type: 'string' },
+              device: { type: 'string' },
+              ts_iso: { type: 'string' },
+              doc_id: { type: 'string' },
+              text: { type: 'string' },
+            },
+            required: ['session_id', 'text'],
+          },
+        },
+      },
+      required: ['ok'],
+    },
+    render: (_args, value) => [{
+      type: 'text',
+      text: value.ok === false
+        ? `会话检索失败：${value.error || '未知错误'}`
+        : (!Array.isArray(value.items) || value.items.length === 0
+          ? '（会话库中没有相关片段）'
+          : value.items
+            .map((it, i) => {
+              const meta = [it.agent || '?', it.device || '?', String(it.ts_iso || '').slice(0, 19), it.doc_id || ''].filter(Boolean).join(' | ');
+              return `(${i + 1}) ${meta}\n${truncate(it.text || it.text_preview || '', SESSION_SEARCH_TOOL_PREVIEW)}`;
+            })
+            .join('\n\n')),
+    }],
+  },
+  async execute(args) {
+    const limit = Math.max(1, Math.min(20, Number(args?.limit) || 6));
+    const items = await sessionSearch(String(args?.query || ''), Math.max(limit, 6), {
+      preview: SESSION_SEARCH_TOOL_PREVIEW,
+      rerank: true, // 工具调用开精排(与 hermes 同语义); 预取指针腿才用 rerank=0
+      budgetMs: BUDGET_SEARCH_MS,
+    });
+    return {
+      ok: true,
+      total: items.length,
+      items: items.slice(0, limit).map((it) => ({
+        session_id: String(it.session_id || ''),
+        text: truncate(it.text || it.text_preview || '', SESSION_SEARCH_TOOL_PREVIEW),
+        ...(it.agent ? { agent: String(it.agent) } : {}),
+        ...(it.device ? { device: String(it.device) } : {}),
+        ...(it.ts_iso ? { ts_iso: String(it.ts_iso) } : {}),
+        ...(it.doc_id ? { doc_id: String(it.doc_id) } : {}),
+      })),
+    };
+  },
+};
+
+const nebulaSessionReadTool = {
+  name: 'nebula_session_read',
+  description:
+    '按 session_id 取出某个历史会话的全部段落(时间序)，用于深度下钻：' +
+    '先用 nebula_session_search（或召回指针行）定位会话，再用本工具读完整上下文。',
+  parameters: {
+    type: 'object',
+    additionalProperties: true,
+    properties: {
+      session_id: { type: 'string', description: '从指针行或 search 结果里取的会话 id。' },
+      limit: { type: 'integer', description: '最多返回段数，默认 20，最大 50。' },
+    },
+    required: ['session_id'],
+  },
+  timeoutMs: 20_000,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean' },
+        error: { type: 'string' },
+        session_id: { type: 'string' },
+        count: { type: 'integer' },
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              doc_id: { type: 'string' },
+              ts_iso: { type: 'string' },
+              agent: { type: 'string' },
+              device: { type: 'string' },
+              text: { type: 'string' },
+            },
+            required: ['text'],
+          },
+        },
+      },
+      required: ['ok'],
+    },
+    render: (_args, value) => [{
+      type: 'text',
+      text: value.ok === false
+        ? `取会话失败：${value.error || '未知错误'}`
+        : (!value.items || value.items.length === 0
+          ? `会话 ${value.session_id} 没有段落 (session_id 可能不对)。`
+          : `会话 ${value.session_id}: ${value.items.length} 段 (时间序):\n\n`
+            + value.items
+              .map((it, i) => {
+                const meta = [it.agent || '?', it.device || '?', String(it.ts_iso || '').slice(0, 19), it.doc_id || ''].filter(Boolean).join(' | ');
+                return `(${i + 1}) ${meta}\n${truncate(it.text || '', SESSION_SEARCH_TOOL_PREVIEW)}`;
+              })
+              .join('\n\n')),
+    }],
+  },
+  async execute(args) {
+    const sid = String(args?.session_id || '').trim();
+    if (!sid) return { ok: false, error: 'session_id 不能为空' };
+    const limit = Math.max(1, Math.min(50, Number(args?.limit) || 20));
+    const out = await sessionFull(sid, limit);
+    if (out.error) return { ok: false, error: out.error, session_id: sid };
+    return {
+      ok: true,
+      session_id: sid,
+      count: out.items.length,
+      items: out.items.map((it) => ({
+        text: truncate(it.text || it.text_preview || '', SESSION_SEARCH_TOOL_PREVIEW),
+        ...(it.doc_id ? { doc_id: String(it.doc_id) } : {}),
+        ...(it.ts_iso ? { ts_iso: String(it.ts_iso) } : {}),
+        ...(it.agent ? { agent: String(it.agent) } : {}),
+        ...(it.device ? { device: String(it.device) } : {}),
+      })),
+    };
+  },
+};
+
 const nebulaStatsTool = {
   name: 'nebula_stats',
   description: '查看知识星云后端的健康与规模（记忆总数、原子数、scope 分布）。用于确认星云是否可达。',
@@ -874,6 +1049,71 @@ const nebulaStatsTool = {
 };
 
 // ---------------------------------------------------------------------------
+// Session RAG — 会话段检索/下钻 + 预取指针腿
+// ---------------------------------------------------------------------------
+
+async function sessionSearch(query, fetch, { preview = 300, rerank = false, budgetMs = 6000 } = {}) {
+  const q = encodeURIComponent(String(query || '').slice(0, 2000));
+  const url = `/api/session-rag/search?q=${q}&limit=${Math.max(fetch, 4)}&rerank=${rerank ? 1 : 0}&preview=${Math.round(preview)}`;
+  const res = await nebulaApi('GET', url, undefined, budgetMs);
+  const body = res.json;
+  if (res.status >= 400 && res.status < 500) return []; // 端点缺失/参数错: 不试下一路(同一后端)
+  if (!body || !Array.isArray(body.items)) return [];
+  return body.items.filter((it) => it && typeof it === 'object');
+}
+
+async function sessionFull(sessionId, limit) {
+  const url = `/api/session-rag/session?session_id=${encodeURIComponent(sessionId)}&limit=${limit}`;
+  const res = await nebulaApi('GET', url, undefined, BUDGET_SEARCH_MS);
+  const body = res.json;
+  if (!body) return { error: res.error || `HTTP ${res.status}` };
+  const items = body.items || body.docs || [];
+  return { items: Array.isArray(items) ? items : [] };
+}
+
+function sessionTopicOf(it) {
+  const txt = it.text_preview || it.text || '';
+  const m = /topic=([^\]]*)\]/.exec(txt);
+  if (m) return m[1].trim();
+  const body = txt.includes('\n') ? txt.split('\n').slice(1).join('').trim() : txt.trim();
+  return truncate(body, 60);
+}
+
+function pointerLine(it) {
+  const ts = String(it.ts_iso || '').slice(0, 10);
+  const topic = sessionTopicOf(it).slice(0, 70);
+  const head = [it.agent, it.device].filter(Boolean).join(' / ');
+  let line = `📂 会话: ${ts} ${topic}`;
+  if (head) line += ` (${head})`;
+  line += ' — 需要细节用 nebula_session_search 下钻';
+  const sid = it.session_id || '';
+  if (sid) line += ` [${sid}]`;
+  return truncate(line, 200);
+}
+
+// RRF(k=60) 融合 mem/session 两路排名, 取 session 侧前 limit 条 (按 session 去重)。
+// 只用排名不用绝对分: 规避 BGE-M3 余弦窄带 (相关/跑题都落 0.70-0.76)。
+function rrfSessionPick(memItems, sessItems, limit) {
+  const k = 60;
+  const scored = [];
+  memItems.forEach((_it, rank) => scored.push({ side: 'm', rank, v: 1 / (k + rank + 1) }));
+  sessItems.forEach((_it, rank) => scored.push({ side: 's', rank, v: 1 / (k + rank + 1) }));
+  scored.sort((a, b) => b.v - a.v);
+  const picked = [];
+  const seen = new Set();
+  for (const s of scored) {
+    if (s.side !== 's') continue;
+    const it = sessItems[s.rank];
+    const sid = (it && it.session_id) || '';
+    if (!sid || seen.has(sid)) continue;
+    seen.add(sid);
+    picked.push(it);
+    if (picked.length >= limit) break;
+  }
+  return picked;
+}
+
+// ---------------------------------------------------------------------------
 // Prefetch (automatic recall injected at each step boundary)
 // ---------------------------------------------------------------------------
 
@@ -891,7 +1131,7 @@ function sleep(ms, signal) {
   });
 }
 
-async function recallFor(query) {
+async function recallMemLeg(query) {
   const routes = await loadRoutes();
   if (routes.length === 0) return []; // 未配置: 静默跳过
   if (routes.every((b) => (routeFails.get(b) || 0) > Date.now())) {
@@ -909,17 +1149,31 @@ async function recallFor(query) {
     .slice(0, PREFETCH_LIMIT);
 }
 
-function recallText(items) {
-  const lines = items.map((it, i) => {
+async function recallSessionLeg(query) {
+  const routes = await loadRoutes();
+  if (routes.length === 0) return [];
+  if (routes.every((b) => (routeFails.get(b) || 0) > Date.now())) return [];
+  // 指针腿不走 rerank (2s 独立预算, 不能被精排拖), preview 只要够拼指针行
+  return sessionSearch(query, PREFETCH_SESSION_FETCH, {
+    preview: PREFETCH_SESSION_PREVIEW,
+    rerank: false,
+    budgetMs: PREFETCH_SESSION_BUDGET_MS,
+  });
+}
+
+function recallText(memItems, ptrs) {
+  const lines = ['[星云记忆自动召回] 以下条目来自知识星云，与当前输入语义相关，由系统自动注入（不是用户说的话）：'];
+  memItems.forEach((it, i) => {
     const score = typeof it.score === 'number' ? it.score.toFixed(2) : '?';
     const scope = it.scope ? ` · ${it.scope}` : '';
-    return `${i + 1}. (${score}${scope}) ${truncate(it.content, PREFETCH_ENTRY_CHARS)}`;
+    lines.push(`${i + 1}. (${score}${scope}) ${truncate(it.content, PREFETCH_ENTRY_CHARS)}`);
   });
-  return (
-    '[星云记忆自动召回] 以下条目来自知识星云，与当前输入语义相关，由系统自动注入（不是用户说的话）：\n'
-    + lines.join('\n')
-    + '\n如需更多细节可调用 nebula_search 检索。'
-  );
+  for (const it of ptrs || []) {
+    const line = pointerLine(it);
+    if (line) lines.push(line);
+  }
+  lines.push('历史记忆细节用 nebula_search、会话原文用 nebula_session_search 下钻。');
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -933,8 +1187,11 @@ export function apply(ctx) {
   const agentDisposers = new Map(); // agent session id -> () => void
 
   const startRecall = (agentSessionId, text) => {
-    const promise = recallFor(text).catch(() => []);
-    pendingByAgent.set(agentSessionId, { promise, startedAt: Date.now(), text, consumed: false });
+    const memPromise = recallMemLeg(text).catch(() => []);
+    const sessPromise = PREFETCH_SESSION_ENABLED
+      ? recallSessionLeg(text).catch(() => [])
+      : Promise.resolve([]);
+    pendingByAgent.set(agentSessionId, { memPromise, sessPromise, startedAt: Date.now(), text });
   };
 
   const attachAgent = (agent) => {
@@ -951,20 +1208,26 @@ export function apply(ctx) {
       const decision = await next();
       if (decision.kind !== 'enter') return decision;
       const st = pendingByAgent.get(key);
-      if (!st || st.consumed) return decision;
+      if (!st) return decision;
       if (Date.now() - st.startedAt > PREFETCH_STALE_MS) {
         pendingByAgent.delete(key);
         return decision;
       }
       const remaining = Math.max(0, st.startedAt + PREFETCH_WAIT_MS - Date.now());
       const budget = Math.min(remaining, 2500);
-      const items = await Promise.race([st.promise, sleep(budget, payload.signal).then(() => null)]);
-      if (!Array.isArray(items)) return decision; // still in flight; a later step may pick it up
-      st.consumed = true;
+      const [memItems, sessItems] = await Promise.all([
+        Promise.race([st.memPromise, sleep(budget, payload.signal).then(() => null)]),
+        Promise.race([st.sessPromise, sleep(Math.min(budget, PREFETCH_SESSION_BUDGET_MS + 500), payload.signal).then(() => null)]),
+      ]);
+      const memReady = Array.isArray(memItems);
+      const sessReady = Array.isArray(sessItems);
+      if (!memReady && !sessReady) return decision; // 两腿都在途: 后续 step 再取
       pendingByAgent.delete(key);
-      if (items.length === 0) return decision;
+      const kept = memReady ? memItems : [];
+      const ptrs = sessReady ? rrfSessionPick(kept, sessItems, PREFETCH_SESSION_LIMIT) : [];
+      if (kept.length === 0 && ptrs.length === 0) return decision;
       const message = createUserMessage({
-        content: [{ type: 'text', text: recallText(items) }],
+        content: [{ type: 'text', text: recallText(kept, ptrs) }],
         source: { kind: 'nebula', form: 'recall' },
       });
       return { ...decision, messages: [...decision.messages, message] };
@@ -979,6 +1242,8 @@ export function apply(ctx) {
   ctx.effect(() => {
     const toolsFiber = ctx.inject(['tools'], (scope) => {
       scope.tools.register(nebulaSearchTool);
+      scope.tools.register(nebulaSessionSearchTool);
+      scope.tools.register(nebulaSessionReadTool);
       scope.tools.register(nebulaAddTool);
       scope.tools.register(nebulaStatsTool);
       scope.tools.register(nebulaOutboxTool);

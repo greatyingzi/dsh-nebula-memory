@@ -12,6 +12,31 @@
 
 ---
 
+## [1.2.0] — 2026-11-11
+
+### Added — Session RAG（历史会话检索/下钻 + 预取指针腿）
+
+- **新工具 `nebula_session_search`**：在会话 RAG 库检索四端（Hermes/Claude Code/Codex/pi 等）历史对话切段；`query`（详细自然语言）/`limit`(≤20)/`device`/`agent` 过滤；工具调用开精排（与 hermes 同语义）。
+- **新工具 `nebula_session_read`**：按 `session_id` 取整段会话原文（时间序，≤50 段），深度下钻用。
+- **预取会话指针腿**：与记忆腿并行、独立 2s 预算、不走精排；**RRF(k=60) 排名融合**两路取 session 侧 top-2（按 session_id 去重）——评测依据：硬阈值 session 召回 0.33 → RRF 0.82。注入「📂 会话: 日期 主题 (agent/设备) — 需要细节用 nebula_session_search 下钻 [session_id]」**指针行**（不注原文，防 prompt 污染）。
+- 服务端：`GET /api/session-rag/search` + `GET /api/session-rag/session`（同一 9200/token；4xx 视为端点缺失不试下一路）。
+
+### Changed
+
+- 召回注入块尾部提示更新：记忆细节 `nebula_search`、会话原文 `nebula_session_search`。
+
+### 升级影响
+
+- 无破坏。**git/registry 安装的设备：装完必须重启 host 进程才加载新代码**（新建会话不够——模块代际是进程级的，实测 remove+install 后注册表仍是旧代际）。
+- `link:` 本地开发安装同样受代际缓存影响，换代码后建议重启。
+
+### 最佳配置建议
+
+- 无需新配置（沿用既有 base_url/token）。想关指针腿：`index.js` 的 `PREFETCH_SESSION_ENABLED=false`。
+- 指针腿预算 `PREFETCH_SESSION_BUDGET_MS=2000`；嫌注入噪可把 `PREFETCH_SESSION_LIMIT` 降到 1。
+
+---
+
 ## [1.1.2] — 2026-11-11
 
 ### Fixed
