@@ -35,19 +35,55 @@
  */
 
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 // ---------------------------------------------------------------------------
 // Harness package imports (resolved from the DSH installation, not the profile)
 // ---------------------------------------------------------------------------
 
+function isDshPackageDir(dir) {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+    return pkg && typeof pkg.name === 'string' && pkg.name === '@deepseek-ai/dsh';
+  } catch {
+    return false;
+  }
+}
+
 function dshRootCandidates() {
-  return [
-    process.env.DSH_ROOT,
-    '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh',
-    '/usr/local/lib/node_modules/@deepseek-ai/dsh',
-    '/opt/local/lib/node_modules/@deepseek-ai/dsh',
-  ].filter(Boolean);
+  const roots = [];
+  const push = (r) => {
+    if (r && !roots.includes(r)) roots.push(r);
+  };
+  if (process.env.DSH_ROOT) push(process.env.DSH_ROOT);
+  // 从运行中的启动器推导 (npm -g / ~/.local / npx / homebrew 全适配):
+  // argv[1] = dsh 入口 (常为 symlink) → realpath 向上找 @deepseek-ai/dsh 包根
+  try {
+    const arg1 = process.argv[1];
+    if (arg1) {
+      let cur = realpathSync(arg1);
+      for (let i = 0; i < 8 && cur && cur !== '/'; i += 1) {
+        const dir = dirname(cur);
+        if (isDshPackageDir(dir)) {
+          push(dir);
+          break;
+        }
+        const nested = join(dir, 'node_modules', '@deepseek-ai', 'dsh');
+        if (existsSync(join(nested, 'package.json'))) {
+          push(nested);
+          break;
+        }
+        cur = dir;
+      }
+    }
+  } catch {
+    // argv[1] 缺失或不可达: 落到静态候选
+  }
+  push('/opt/homebrew/lib/node_modules/@deepseek-ai/dsh');
+  push('/usr/local/lib/node_modules/@deepseek-ai/dsh');
+  push('/opt/local/lib/node_modules/@deepseek-ai/dsh');
+  return roots;
 }
 
 async function importDshPackage(name) {
