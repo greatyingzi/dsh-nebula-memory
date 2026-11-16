@@ -226,7 +226,7 @@ async function loadDeviceConfig() {
   const now = Date.now();
   if (deviceConfig && now - deviceConfigAt < CONFIG_TTL_MS) return deviceConfig;
   deviceConfigAt = now;
-  const cfg = { baseUrl: '', fallbacks: [], token: '', scope: '' };
+  const cfg = { baseUrl: '', fallbacks: [], token: '', scope: '', recapProvider: '', recapModel: '' };
 
   const envBase = String(process.env.NEBULA_BASE_URL || '').trim();
   if (envBase) cfg.baseUrl = envBase;
@@ -252,6 +252,14 @@ async function loadDeviceConfig() {
   }
   if (!cfg.scope && hermesFile && typeof hermesFile.scope === 'string' && hermesFile.scope.trim()) {
     cfg.scope = hermesFile.scope.trim();
+  }
+
+  // recap 轻量路由(可选): 显式配置优先于前台路由 (graph-memory 同款纪律)
+  if (!cfg.recapProvider && dshFile && typeof dshFile.recap_provider === 'string' && dshFile.recap_provider.trim()) {
+    cfg.recapProvider = dshFile.recap_provider.trim();
+  }
+  if (!cfg.recapModel && dshFile && typeof dshFile.recap_model === 'string' && dshFile.recap_model.trim()) {
+    cfg.recapModel = dshFile.recap_model.trim();
   }
 
   cfg.fallbacks = cfg.fallbacks.filter((u) => u !== cfg.baseUrl);
@@ -771,6 +779,53 @@ const nebulaAddTool = {
   },
 };
 
+const RECAP_RETURN_SCHEMA = {
+  name: 'nebula_recap_return',
+  description: '轮末总结轮(nebula recap)专用回调工具: 把刚结束的会话轮总结交给星云记忆插件。仅在 recap 轮调用一次。',
+  parameters: {
+    type: 'object',
+    additionalProperties: true,
+    properties: {
+      content: { type: 'string', description: '本次会话轮收尾总结: 任务/关键结论与决策(含数字、配置值)/未完成事项/下一步推进方向/3-6个检索关键词。500字内, 自含, 不引用本机路径。' },
+      outcome: { type: 'string', enum: ['done', 'partial', 'blocked', 'noconclusion'], description: '本轮完成度: done=达成 / partial=部分完成 / blocked=受阻 / noconclusion=无明确结论。' },
+    },
+    required: ['content'],
+  },
+};
+
+const recapReturnTool = {
+  ...RECAP_RETURN_SCHEMA,
+  timeoutMs: 10_000,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean' },
+        queued: { type: 'boolean' },
+        error: { type: 'string' },
+      },
+      required: ['ok', 'queued'],
+    },
+  },
+  render: (_args, value) => [{
+    type: 'text',
+    text: value && value.ok ? 'recap 总结已交给星云记忆插件(异步入队)' : 'recap 回调未入队: ' + ((value && value.error) || '未知原因'),
+  }],
+  async execute(args, meta) {
+    const content = String(args?.content || '').trim();
+    if (!content) return { ok: false, queued: false, error: 'content 不能为空' };
+    const key = (meta && meta.session && meta.session.id) || activeRecapKey || '';
+    const outcome = String(args?.outcome || '').trim();
+    try {
+      await captureRecap(key, content, outcome);
+      return { ok: true, queued: true };
+    } catch (error) {
+      return { ok: true, queued: true, error: 'queue: ' + (error instanceof Error ? error.message : String(error)) };
+    }
+  },
+};
+
 const nebulaOutboxTool = {
   name: 'nebula_outbox',
   description:
@@ -1177,6 +1232,198 @@ function recallText(memItems, ptrs) {
 }
 
 // ---------------------------------------------------------------------------
+// Recap turn (轮末总结轮 - agent/turn-stopping 触发的辅助 LLM 请求)
+// 设计: 主轮结束(收件箱空、无 steering)后, 插件追加一次独立 LLM 请求(复用 compaction 的
+// ctx.llm.stream 机制, purpose:'nebula-recap', 不并入主会话、不进入可见轮次);
+// 请求只携带一个回调工具 schema nebula_recap_return, 云端把本轮总结经工具参数交回插件;
+// 总结按会话ID关联入队星云(异步入队, 断网不丢), 并缓存为下一轮自动召回的拼接语料:
+// 下一条用户消息触发召回时把 recap 摘要拼进检索 query, 提升代词型短消息的召回命中。
+// ---------------------------------------------------------------------------
+
+const RECAP_ENABLED = true;
+const RECAP_MIN_CHARS = 8;            // 用户消息短于该长度不 recap(与召回门槛一致)
+const RECAP_MAX_TURNS = 3;            // 单会话最多 recap 次数(防循环烧钱)
+const RECAP_MAX_WINDOW_MS = 600_000;  // 首轮起 10 分钟窗口外的轮次不再 recap
+const RECAP_BUDGET_MS = 30_000;       // recap 请求整体预算
+const RECAP_MAX_TOKENS = 900;
+const RECAP_USER_SNIPPET = 1500;      // recap 请求携带的末条用户消息长度
+const RECAP_ASST_SNIPPET = 2200;      // recap 请求携带的末条助手回答尾部
+const RECAP_ENTRY_CHARS = 2400;       // 缓存/入队的总结长度上限
+const RECAP_QUERY_CHARS = 800;        // 拼进检索 query 的 recap 摘要尾部上限
+const RECAP_QUERY_DELAY_MS = 1500;    // recap 到达后留给查询增强的等待窗口
+
+const turnState = new Map();     // agent session id -> recap 状态机
+const recapBuf = new Map();      // agent session id -> 最近 recap 摘要(下轮召回拼接用)
+const pendingRecall = new Set(); // 有 recap 待下轮召回消费的 agent session id
+const recapQueryTail = new Map(); // agent session id -> recap 摘要尾部(检索查询增强用)
+const recapQuerySeen = new Set(); // 已消费过查询增强的会话(防重复)
+const recapProbe = new Map();    // key -> {text, at} 最近一次注入的 recap(供下轮 consumed 观测)
+let recapReqSeq = 0;             // recap 请求序号(新请求使旧请求流失效)
+let recapInflight = false;       // 同一时刻只允许一个 recap 请求
+let activeRecapKey = '';         // 当前 recap 请求所属会话(回调工具兜底用)
+
+function recapLog(kind, msg) {
+  const line = '[nebula-recap] ' + String(msg);
+  if (kind === 'warn') console.warn(line); else console.info(line);
+}
+
+function recapPrompt(userText, asstTail, nebulaSid) {
+  const user = String(userText || '').slice(0, RECAP_USER_SNIPPET);
+  const asst = String(asstTail || '').slice(-RECAP_ASST_SNIPPET);
+  const lines = [
+    '[nebula recap 轮] 主对话刚刚结束。这是收尾总结请求, 不属于主对话:',
+    '你的输出不会被用户看到, 也不会写入主会话历史。',
+    '唯一动作: 调用一次工具 nebula_recap_return, 在 content 参数给出收尾总结, 并给 outcome 完成度(done/partial/blocked/noconclusion); 不要调用其他工具, 不要输出多余正文。',
+    '',
+    'content 要求(500字内, 自含, 不引用本机路径): 1)本轮任务/问题一句话; 2)关键结论/决策/配置值(有数字给数字); 3)未完成事项与下一步; 4)3-6个检索关键词。',
+    '',
+    '【用户最后消息】' + user,
+    '【助手最后回答(尾部)】' + (asst || '(无)'),
+  ];
+  if (nebulaSid) lines.push('【关联会话ID】' + nebulaSid);
+  return lines.join('\n');
+}
+
+function assistantTextOf(message) {
+  try {
+    const content = message && message.content;
+    if (!Array.isArray(content)) return '';
+    return content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim();
+  } catch { return ''; }
+}
+
+/** 从会话日志尾部取最近 assistant 文本(最多数条拼接), 供 recap 请求参考。 */
+function lastAssistantTail(agent, want) {
+  try {
+    const session = agent && agent.session;
+    const log = session && Array.isArray(session.log) ? session.log : null;
+    if (!log) return '';
+    let out = '';
+    for (let i = log.length - 1; i >= 0 && out.length < want; i -= 1) {
+      const msg = typeof session.deriveEventMessage === 'function' ? session.deriveEventMessage(log[i]) : null;
+      if (!msg || msg.role !== 'assistant') continue;
+      const t = assistantTextOf(msg);
+      if (t) out = out ? t + '\n' + out : t;
+    }
+    return out.slice(-want);
+  } catch { return ''; }
+}
+
+/** recap 请求器: 独立辅助 LLM 调用, 解析 tool-call/text, 捕获总结。 */
+async function recapTurn(ctx, agent, seq, signal) {
+  const key = agent.session.id;
+  const ts = turnState.get(key);
+  if (!ts || seq !== recapReqSeq) return;
+  let route = null;
+  try {
+    const header = typeof agent.session.requestHeader === 'function' ? agent.session.requestHeader() : undefined;
+    const cfg = header && header.config;
+    if (cfg && cfg.provider && cfg.model) route = { provider: cfg.provider, model: cfg.model };
+  } catch { route = null; }
+  try {
+    const dev = await loadDeviceConfig();
+    if (dev && dev.recapProvider && dev.recapModel) route = { provider: dev.recapProvider, model: dev.recapModel };
+  } catch { /* 轻量路由未配置则沿用前台路由 */ }
+  if (!route) return;
+  recapLog('info', 'trigger provider=' + route.provider + ' model=' + route.model);
+  const llm = ctx && ctx.llm;
+  if (!llm || typeof llm.stream !== 'function') return;
+  const controller = new AbortController();
+  const abortAll = () => { try { controller.abort(); } catch {} };
+  if (signal) { if (signal.aborted) abortAll(); else signal.addEventListener('abort', abortAll, { once: true }); }
+  const timer = setTimeout(abortAll, RECAP_BUDGET_MS);
+  activeRecapKey = key;
+  try {
+    const messages = [{ role: 'user', content: [{ type: 'text', text: recapPrompt(ts.lastUserText, lastAssistantTail(agent, RECAP_ASST_SNIPPET), key) }] }];
+    const options = {
+      provider: route.provider,
+      model: route.model,
+      messages,
+      tools: [RECAP_RETURN_SCHEMA],
+      maxTokens: RECAP_MAX_TOKENS,
+      sessionId: key,
+      purpose: 'nebula-recap',
+      signal: controller.signal,
+    };
+    let text = '';
+    let toolName = '';
+    let toolArgs = '';
+    let outcome = '';
+    let finishKind = '';
+    for await (const chunk of llm.stream(options)) {
+      if (seq !== recapReqSeq) return;
+      if (chunk.type === 'text-delta' && chunk.text) text += chunk.text;
+      else if (chunk.type === 'tool-call-delta') {
+        if (chunk.name) toolName = chunk.name;
+        if (chunk.argumentsDelta) toolArgs += chunk.argumentsDelta;
+      } else if (chunk.type === 'finish') {
+        finishKind = String(chunk.reason?.kind || '');
+      }
+    }
+    if (seq !== recapReqSeq) return;
+    // graph-memory 纪律: 被截断的提取不可信(检索关键词在尾部, 截断即丢), 弃用不落库。
+    if (finishKind === 'max-tokens') { recapLog('warn', 'max-tokens 截断, 本次总结弃用'); return; }
+    let captured = '';
+    if (toolName && toolName.indexOf('recap') !== -1) {
+      try {
+        const parsed = JSON.parse(toolArgs || '{}');
+        captured = String(parsed.content || '').trim();
+        outcome = String(parsed.outcome || '').trim();
+      } catch { captured = ''; }
+    }
+    if (!captured && text.trim()) captured = text.trim();
+    if (captured) {
+      recapLog('info', 'captured ' + captured.length + ' chars outcome=' + (outcome || '未标注'));
+      await captureRecap(key, captured, outcome);
+    }
+  } catch (error) {
+    recapLog('warn', 'failed: ' + (error instanceof Error ? error.message : String(error)));
+  } finally {
+    clearTimeout(timer);
+    if (activeRecapKey === key) activeRecapKey = '';
+  }
+}
+
+/** 捕获总结: 入队星云(带会话ID+完成度) + 缓存为下轮召回拼接语料。 */
+async function captureRecap(key, content, outcome) {
+  const trimmed = String(content || '').slice(0, RECAP_ENTRY_CHARS);
+  if (!trimmed) return;
+  const outcomeTag = String(outcome || '').trim();
+  if (key && turnState.has(key)) {
+    recapBuf.set(key, trimmed);
+    pendingRecall.add(key);
+    recapQueryTail.set(key, trimmed.slice(-RECAP_QUERY_CHARS));
+    recapQuerySeen.delete(key);
+  }
+  try {
+    const device = await loadDeviceConfig();
+    const stored = '【轮末总结】' + (outcomeTag ? '[outcome:' + outcomeTag + '] ' : '') + trimmed + '\n【会话ID】' + (key || '未知');
+    await outboxEnqueue({ content: stored.slice(0, 8000), scope: device.scope || 'dsh-recap', tags: 'recap,auto' });
+  } catch {
+    // 星云入队失败不影响本地召回拼接缓存
+  }
+}
+
+/** consumed 观测: 助手回复与上轮 recap 的实词重合度(仅统计, 不改行为)。 */
+function recapProbeConsumed(replyText, recapText) {
+  try {
+    const stop = new Set(['的','了','是','在','我','你','他','这','那','和','与','或','但','就','都','也','很','要','会','能','有','没','不','一个','什么','怎么','可以','已经','如果','然后','因为','所以','我们','他们','自己','还是','使用','进行','通过','比如','直接','一定','需要','现在','起来','下来','而且','并且','作为','以及','关于','然后','接着','完成','问题','内容','结果']);
+    const words = (s) => String(s || '').toLowerCase().match(/[a-z0-9_]{2,}|[一-龥]{2,6}/g) || [];
+    const rSet = new Set(words(replyText).filter((w) => !stop.has(w) && w.length >= 2));
+    if (!rSet.size) return 0;
+    let hit = 0;
+    for (const w of new Set(words(recapText).filter((x) => !stop.has(x) && x.length >= 2))) if (rSet.has(w)) hit += 1;
+    return hit;
+  } catch { return 0; }
+}
+
+/** 下一轮召回注入文本: recap 摘要块 + 常规召回块。 */
+function recapText(kept, ptrs, recapBlockText) {
+  const head = recapBlockText ? '[上一轮 recap 摘要]\n' + recapBlockText + '\n' : '';
+  return head + recallText(kept, ptrs);
+}
+
+// ---------------------------------------------------------------------------
 // Plugin entry
 // ---------------------------------------------------------------------------
 
@@ -1187,16 +1434,33 @@ export function apply(ctx) {
   const agentDisposers = new Map(); // agent session id -> () => void
 
   const startRecall = (agentSessionId, text) => {
-    const memPromise = recallMemLeg(text).catch(() => []);
+    let queryText = text;
+    // 查询侧 recap 增强: 上一轮总结尾部拼在消息前面, 让代词型短消息也能撞上历史语义
+    // (若 recap 尚未到达, pre-step 侧有等待补发逻辑兜底)
+    const tail = recapQueryTail.get(agentSessionId);
+    if (tail && !recapQuerySeen.has(agentSessionId)) {
+      queryText = '[上轮话题] ' + tail + '\n[本条消息] ' + text;
+      recapQuerySeen.add(agentSessionId);
+      recapLog('info', 'query-augmented +' + tail.length + ' chars');
+    }
+    const memPromise = recallMemLeg(queryText).catch(() => []);
     const sessPromise = PREFETCH_SESSION_ENABLED
-      ? recallSessionLeg(text).catch(() => [])
+      ? recallSessionLeg(queryText).catch(() => [])
       : Promise.resolve([]);
     pendingByAgent.set(agentSessionId, { memPromise, sessPromise, startedAt: Date.now(), text });
+    let ts = turnState.get(agentSessionId);
+    if (!ts) {
+      ts = { firstTurnAt: Date.now(), turnCount: 0, lastSourceWasUser: false, lastUserText: '' };
+      turnState.set(agentSessionId, ts);
+    }
+    ts.lastSourceWasUser = true;
+    ts.lastUserText = text;
   };
 
   const attachAgent = (agent) => {
     const key = agent.session.id;
     if (agentDisposers.has(key)) return;
+    turnState.set(key, { firstTurnAt: Date.now(), turnCount: 0, lastSourceWasUser: false, lastUserText: '' });
     const offInserted = agent.ctx.on('agent/inbox/inserted', ({ message }) => {
       if (!PREFETCH_ENABLED) return;
       if (message?.source?.kind !== 'user') return;
@@ -1222,20 +1486,64 @@ export function apply(ctx) {
       const memReady = Array.isArray(memItems);
       const sessReady = Array.isArray(sessItems);
       if (!memReady && !sessReady) return decision; // 两腿都在途: 后续 step 再取
+      // recap 迟到补发: 两腿已就绪但 recap 刚好到达, 再给它一个短窗口重发查询
+      if (!recapQuerySeen.has(key) && recapQueryTail.has(key) && Date.now() - st.startedAt < RECAP_QUERY_DELAY_MS) {
+        const tail = recapQueryTail.get(key) || '';
+        if (tail) {
+          const q = '[上轮话题] ' + tail + '\n[本条消息] ' + st.text;
+          recapQuerySeen.add(key);
+          recapLog('info', 'query-augmented(late) +' + tail.length + ' chars');
+          pendingByAgent.set(key, { memPromise: recallMemLeg(q).catch(() => []), sessPromise: recallSessionLeg(q).catch(() => []), startedAt: st.startedAt, text: st.text });
+          return decision; // 下一 step 用增强结果
+        }
+      }
       pendingByAgent.delete(key);
       const kept = memReady ? memItems : [];
       const ptrs = sessReady ? rrfSessionPick(kept, sessItems, PREFETCH_SESSION_LIMIT) : [];
-      if (kept.length === 0 && ptrs.length === 0) return decision;
+      let recapBlockText = '';
+      if (pendingRecall.has(key)) {
+        recapBlockText = recapBuf.get(key) || '';
+        pendingRecall.delete(key);
+      }
+      if (kept.length === 0 && ptrs.length === 0 && !recapBlockText) return decision;
+      if (recapBlockText) recapProbe.set(key, { text: recapBlockText, at: Date.now() });
       const message = createUserMessage({
-        content: [{ type: 'text', text: recallText(kept, ptrs) }],
+        content: [{ type: 'text', text: recapText(kept, ptrs, recapBlockText) }],
         source: { kind: 'nebula', form: 'recall' },
       });
       return { ...decision, messages: [...decision.messages, message] };
     });
+    const offTurnStopping = agent.ctx.on('agent/turn-stopping', async ({ signal } = {}) => {
+      if (!RECAP_ENABLED) return;
+      const ts = turnState.get(key);
+      if (!ts) return;
+      ts.turnCount += 1;
+      if (!ts.lastSourceWasUser || !ts.lastUserText || ts.lastUserText.length < RECAP_MIN_CHARS) return;
+      if (Date.now() - ts.firstTurnAt > RECAP_MAX_WINDOW_MS || ts.turnCount > RECAP_MAX_TURNS) return;
+      if (recapInflight) return;
+      recapInflight = true;
+      const seq = ++recapReqSeq;
+      // fire-and-forget: 不阻塞 agent loop 收尾(hook 只负责发起)
+      void recapTurn(ctx, agent, seq, signal).catch(() => {}).finally(() => { recapInflight = false; });
+      // consumed 观测探针: 刚结束这轮的回复是否真的用上了上轮注入的 recap(仅日志)
+      const probe = recapProbe.get(key);
+      if (probe && Date.now() - probe.at < 600_000) {
+        const reply = lastAssistantTail(agent, 3000);
+        const hits = reply ? recapProbeConsumed(reply, probe.text) : 0;
+        recapLog('info', 'probe consumed-words=' + hits + (hits >= 5 ? ' (像是用上了)' : ''));
+        recapProbe.delete(key);
+      }
+    });
     agentDisposers.set(key, () => {
       offInserted?.();
       offPreStep?.();
+      offTurnStopping?.();
       pendingByAgent.delete(key);
+      turnState.delete(key);
+      recapBuf.delete(key);
+      recapQueryTail.delete(key);
+      recapQuerySeen.delete(key);
+      recapProbe.delete(key);
     });
   };
 
@@ -1247,6 +1555,7 @@ export function apply(ctx) {
       scope.tools.register(nebulaAddTool);
       scope.tools.register(nebulaStatsTool);
       scope.tools.register(nebulaOutboxTool);
+      scope.tools.register(recapReturnTool);
     });
 
     const offCreated = ctx.on('agent/created', ({ agent }) => {

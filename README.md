@@ -4,6 +4,7 @@
 
 - **自动召回**：每条真实用户消息进会话即在星云语义检索，相关记忆（余弦 ≥0.72，top-3）+ **会话指针行**（RRF 融合，top-2）在下一 step 边界自动拼进上下文——不打工具、零操作，模型直接"记得"跨设备历史结论。注入块标记 `[星云记忆自动召回]`，源 `{kind:'nebula', form:'recall'}`，可从会话日志追溯。
 - **手动工具**：`nebula_search`（RRF+rerank 融合检索）/ `nebula_session_search`（四端历史会话切段检索）/ `nebula_session_read`（按 session_id 下钻整段会话）/ `nebula_add`（**异步入队，永不失败**）/ `nebula_stats`（健康规模）/ `nebula_outbox`（队列管理）。
+- **轮末 recap（v1.3.0）**：主轮结束后插件自主发起一次独立辅助 LLM 请求（工具回调 `nebula_recap_return` 交总结，带 `outcome` 完成度），总结入队星云并按会话 ID 关联；下一条用户消息召回时**注入侧**拼「[上一轮 recap 摘要]」块、**查询侧**把 recap 尾部拼进检索 query——代词型短消息（「继续」「那怎么办」）也能召回上一轮话题。主会话历史零写入，KV cache 零影响。详见 [CHANGELOG v1.3.0](CHANGELOG.md)。
 - **写入队列**：断网/抖动时写入先固化本地 JSONL，后台批量补传，指数退避，容量受控（详见 [CHANGELOG v1.1.0](CHANGELOG.md)）。
 - **多路由 failover**：主+备地址，失败冷却 30s、按实测延迟排序、总预算内快速失败。
 - **零内嵌端点**：包内无任何 IP/域名/token，**每台设备装后自配**。
@@ -69,6 +70,8 @@ dsh plugin --profile <profile> add https://github.com/greatyingzi/dsh-nebula-mem
 | `fallback_url` | string 或 string[] | 备用路由（可多条）；没有可不写 |
 | `token` | string | 64-hex Bearer token。**hermes 共存设备可省**（自动读 `~/.hermes/nebula/token`，再退 `~/.hermes/.env` 的 `CLOUD_MEMORY_TOKEN`） |
 | `scope` | string | `nebula_add` 未显式传 scope 时的默认值；可省（服务端默认 `general`） |
+| `recap_provider` | string | 可选。轮末 recap 的轻量路由 provider；配置后**优先于会话前台路由**（recap 是辅助负载，显式配置的便宜/免费模型更合适） |
+| `recap_model` | string | 可选。与 `recap_provider` 成对配置；只配一个时整对不生效 |
 
 ### base_url 怎么选（按网络位置）
 
@@ -120,6 +123,13 @@ dsh plugin --profile <profile> add https://github.com/greatyingzi/dsh-nebula-mem
 | `OUTBOX_BACKOFF_BASE/CAP` | 30s / 30min | 退避基数/封顶 |
 | `OUTBOX_BATCH` | 10 | 每拍批量补传条数 |
 | `BUDGET_SEARCH/STATS/WRITE_MS` | 9s/8s/14s | 各调用总预算（跨路由），超时快速失败 |
+| `RECAP_ENABLED` | true | 轮末 recap 总开关（v1.3.0） |
+| `RECAP_MAX_TURNS` | 3 | 单会话最多 recap 次数（防循环烧钱） |
+| `RECAP_MAX_WINDOW_MS` | 10min | 首轮起超出窗口的轮次不再 recap |
+| `RECAP_BUDGET_MS` | 30s | recap 请求整体预算 |
+| `RECAP_MAX_TOKENS` | 900 | recap 输出上限；**触顶即弃用**（截断总结不落库） |
+| `RECAP_QUERY_CHARS` | 800 | 拼进检索 query 的 recap 尾部长度 |
+| `RECAP_QUERY_DELAY_MS` | 1500 | recap 迟到时 pre-step 的补发等待窗口 |
 
 ---
 

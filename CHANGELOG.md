@@ -12,6 +12,39 @@
 
 ---
 
+## [1.3.0] — 2026-11-16
+
+### Added — 轮末 recap（Hermes 式收尾总结 → 下轮召回增强）
+
+- **recap 轮**：主轮结束（收件箱空、无 steering）时，插件在 `agent/turn-stopping` 钩子自主发起一次**独立辅助 LLM 请求**（复用 `ctx.llm.stream`，`purpose:'nebula-recap'`）——不并入主会话、不写会话历史、不改下一轮主请求前缀（KV cache 零影响）。
+- **工具回调交总结**：recap 请求只挂一个回调工具 `nebula_recap_return`，云端把轮末总结经 `content` 参数交回；`outcome` 参数（`done/partial/blocked/noconclusion`）标注本轮完成度，入库时以 `[outcome:xxx]` 前缀标注。
+- **双写**：① 异步入队星云（正文=`【轮末总结】…【会话ID】…`，scope=设备 scope 或 `dsh-recap`，tags=`recap,auto`）；② 内存缓存按会话 ID 关联。
+- **下轮自动使用（两条路）**：a) 注入侧——下一条用户消息的召回块顶部拼「[上一轮 recap 摘要]」块；b) 查询侧——检索 query 变为 `[上轮话题] <recap尾部>\n[本条消息] <原文>`（mem/session 两腿同步），**代词型短消息（「继续」「那怎么办」）不再只靠实体词撞运气**。recap 迟到时 pre-step 有 1500ms 补发窗口。
+- **consumed 观测探针**：注入 recap 时快照，下轮 `turn-stopping` 用实词重合启发式（中英分词+停用词）评估助手回复是否真用上了 recap，日志 `probe consumed-words=N`（仅观测，不改行为）。
+- **观测日志**：`[nebula-recap] trigger/captured/query-augmented/failed/probe` 全链路 console 日志。
+
+### Changed
+
+- `loadDeviceConfig` 新增可选字段 `recap_provider`/`recap_model`（`~/.dsh/nebula-memory.json`）：显式配置的**轻量 recap 路由**优先于会话前台路由（graph-memory 同款纪律）。
+- 被截断的 recap 弃用：`finish` 为 `max-tokens` 时该次总结不落库不缓存（截断即丢尾部关键词，fail-closed）。
+
+### 护栏（防失控）
+
+- 用户消息 <8 字符不 recap；单会话最多 3 次；首轮起 10 分钟窗口外停用；请求预算 30s；全局同时 1 个在飞；流式 seq 失效防新旧错乱；插件 dispose 清理全部 recap 状态；任何失败静默，不拖累主轮。
+
+### 升级影响
+
+- 无破坏。**装完必须重启 host 进程才加载新代码**（同 1.2.0 结论：模块代际是进程级的）。
+- recap 每次为独立小请求（输入 ~4-5k tok、输出 ≤900 tok、每会话 ≤3 次）；走云端 API 无本地 KV 争抢顾虑；自建 vLLM/SGLang 满载时理论上有极小 LRU 逐出窗口。
+
+### 最佳配置建议
+
+- 想控成本：在 `~/.dsh/nebula-memory.json` 配 `recap_provider`/`recap_model` 指向便宜/免费模型。
+- 想关 recap：`index.js` 顶部 `RECAP_ENABLED=false`（其余 recap 常量 `RECAP_MAX_TURNS`/`RECAP_MAX_WINDOW_MS`/`RECAP_BUDGET_MS`/`RECAP_QUERY_CHARS` 等见 README 调优表）。
+- 部署验证方式：正常聊完一轮 → 星云出现 `【轮末总结】` 条目（tags=recap,auto）→ 下一条消息召回块顶部出现 `[上一轮 recap 摘要]` → 日志出现 `[nebula-recap]` 行。
+
+---
+
 ## [1.2.0] — 2026-11-11
 
 ### Added — Session RAG（历史会话检索/下钻 + 预取指针腿）
