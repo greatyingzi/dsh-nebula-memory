@@ -38,6 +38,11 @@ import { appendFile, readFile, rename, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+
+// [NEBULA-TRACE] 调试插桩: 设置 env NEBULA_TRACE_FILE 开启, 默认关闭(零开销)
+import { appendFileSync as __nebAppend } from 'node:fs';
+const __NEB_TRACE = process.env.NEBULA_TRACE_FILE || '';
+function __nebTrace(m) { if (!__NEB_TRACE) return; try { __nebAppend(__NEB_TRACE, new Date().toISOString() + ' ' + m + '\n'); } catch {} }
 // ---------------------------------------------------------------------------
 // Harness package imports (resolved from the DSH installation, not the profile)
 // ---------------------------------------------------------------------------
@@ -105,20 +110,20 @@ const { createUserMessage } = await importDshPackage('dsh-llm');
 // Tunables
 // ---------------------------------------------------------------------------
 
-const ROUTE_CAP_MS = 6000;            // per-route cap inside one call
-const BUDGET_SEARCH_MS = 9000;        // total budget: failover across routes, then clean error
+const ROUTE_CAP_MS = 8000;            // per-route cap inside one call
+const BUDGET_SEARCH_MS = 15000;       // total budget: failover across routes, then clean error
 const BUDGET_WRITE_MS = 14000;        // write embeds + dedupes before answering
-const BUDGET_STATS_MS = 8000;
-const BUDGET_RECALL_MS = 6000;
+const BUDGET_STATS_MS = 12000;
+const BUDGET_RECALL_MS = 10000;
 const ROUTE_COOLDOWN_MS = 30_000;     // failed routes ride last for this long
 const ROUTE_LAT_ALPHA = 0.4;          // EWMA factor for route latency
 
 const PREFETCH_ENABLED = true;
-const PREFETCH_MIN_QUERY_CHARS = 8;   // skip greetings / one-word nudges
+const PREFETCH_MIN_QUERY_CHARS = 0;   // 0 = 不限制字数（全面召回）
 const PREFETCH_MIN_SCORE = 0.72;      // BGE-M3 cosine band, same floor as hermes
 const PREFETCH_LIMIT = 3;             // max memories injected per turn
 const PREFETCH_ENTRY_CHARS = 300;     // truncate each entry
-const PREFETCH_WAIT_MS = 3500;        // max extra wait at pre-step for a slow recall
+const PREFETCH_WAIT_MS = 7000;        // max extra wait at pre-step for a slow recall (老机器 embedding 慢)
 const PREFETCH_STALE_MS = 30_000;     // discard recall older than this
 
 // --- session-RAG 指针腿 (会话段索引, 对齐 hermes MEM_INTERACTION §3.1) ---
@@ -128,7 +133,7 @@ const PREFETCH_STALE_MS = 30_000;     // discard recall older than this
 const PREFETCH_SESSION_ENABLED = true;
 const PREFETCH_SESSION_LIMIT = 2;     // max pointer lines per turn
 const PREFETCH_SESSION_FETCH = 8;     // candidates fetched from the session index
-const PREFETCH_SESSION_BUDGET_MS = 2000; // independent budget for the session leg
+const PREFETCH_SESSION_BUDGET_MS = 7000; // independent budget for the session leg
 const PREFETCH_SESSION_PREVIEW = 300; // preview chars fetched for pointer building
 const SESSION_SEARCH_TOOL_PREVIEW = 1500; // 下钻工具的正文预览长度
 
@@ -331,8 +336,8 @@ function routeOrder(routes) {
     const la = routeLat.get(a);
     const lb = routeLat.get(b);
     if (la === undefined && lb === undefined) return 0;
-    if (la === undefined) return -1;
-    if (lb === undefined) return 1;
+    if (la === undefined) return 1;   // 未知延迟排最后(避免不可达兜底被优先试)
+    if (lb === undefined) return -1;
     return la - lb;
   });
   return [...live, ...cooled];
@@ -360,7 +365,9 @@ async function nebulaApi(method, path, data, totalBudgetMs) {
   const token = await loadToken();
   const deadline = Date.now() + totalBudgetMs;
   let lastError = '所有星云地址均失败';
-  for (const base of routeOrder(routes)) {
+  const __order = routeOrder(routes);
+  __nebTrace('api ' + method + ' ' + String(path).slice(0, 36) + ' order=' + JSON.stringify(__order));
+  for (const base of __order) {
     const remaining = deadline - Date.now();
     if (remaining <= 200) break; // 总预算耗尽, 快速失败并携带原因
     const perRoute = Math.min(remaining, ROUTE_CAP_MS);
@@ -377,10 +384,12 @@ async function nebulaApi(method, path, data, totalBudgetMs) {
         body: data !== undefined ? JSON.stringify(data) : undefined,
         signal: ctrl.signal,
       });
+      __nebTrace('api ok ' + base + ' ' + (Date.now() - started) + 'ms');
       noteRoute(base, true, Date.now() - started);
       const json = await res.json().catch(() => null);
       return { status: res.status, json };
     } catch (error) {
+      __nebTrace('api fail ' + base + ' :: ' + (error instanceof Error ? error.message : String(error)));
       noteRoute(base, false);
       lastError = `${base} 不可达（${error instanceof Error ? error.message : String(error)}）`;
     } finally {
@@ -1107,7 +1116,7 @@ const nebulaStatsTool = {
 // Session RAG — 会话段检索/下钻 + 预取指针腿
 // ---------------------------------------------------------------------------
 
-async function sessionSearch(query, fetch, { preview = 300, rerank = false, budgetMs = 6000 } = {}) {
+async function sessionSearch(query, fetch, { preview = 300, rerank = false, budgetMs = 15000 } = {}) {
   const q = encodeURIComponent(String(query || '').slice(0, 2000));
   const url = `/api/session-rag/search?q=${q}&limit=${Math.max(fetch, 4)}&rerank=${rerank ? 1 : 0}&preview=${Math.round(preview)}`;
   const res = await nebulaApi('GET', url, undefined, budgetMs);
@@ -1195,7 +1204,8 @@ async function recallMemLeg(query) {
   // 纯向量路端点: score = BGE-M3 余弦 (0..1), 与 hermes prefetch 的 0.72 窄带阈值同语义。
   // /search 是 RRF+rerank 融合路, score 为 rerank logit(负值), 不能用过阈值筛。
   const q = encodeURIComponent(query.slice(0, 2000));
-  const res = await nebulaApi('GET', `/api/memories/search?q=${q}&limit=${PREFETCH_LIMIT + 2}`, undefined, BUDGET_RECALL_MS);
+  __nebTrace('recallMem q=' + String(query).slice(0,30));
+  const res = await nebulaApi('GET', '/api/memories/search?q=' + q + '&limit=' + (PREFETCH_LIMIT + 2), undefined, BUDGET_RECALL_MS).catch((e) => { __nebTrace('ERR memSearch: ' + (e && e.message || e)); return {}; });
   const body = res.json;
   if (!body || body.ok !== true || !Array.isArray(body.items)) return [];
   return body.items
@@ -1208,7 +1218,7 @@ async function recallSessionLeg(query) {
   const routes = await loadRoutes();
   if (routes.length === 0) return [];
   if (routes.every((b) => (routeFails.get(b) || 0) > Date.now())) return [];
-  // 指针腿不走 rerank (2s 独立预算, 不能被精排拖), preview 只要够拼指针行
+  // 指针腿不走 rerank（独立预算, 不能被精排拖）, preview 只要够拼指针行
   return sessionSearch(query, PREFETCH_SESSION_FETCH, {
     preview: PREFETCH_SESSION_PREVIEW,
     rerank: false,
@@ -1241,7 +1251,7 @@ function recallText(memItems, ptrs) {
 // ---------------------------------------------------------------------------
 
 const RECAP_ENABLED = true;
-const RECAP_MIN_CHARS = 8;            // 用户消息短于该长度不 recap(与召回门槛一致)
+const RECAP_MIN_CHARS = 0;            // 0 = 不限制字数（与召回门槛一致）
 const RECAP_MAX_TURNS = 3;            // 单会话最多 recap 次数(防循环烧钱)
 const RECAP_MAX_WINDOW_MS = 600_000;  // 首轮起 10 分钟窗口外的轮次不再 recap
 const RECAP_BUDGET_MS = 30_000;       // recap 请求整体预算
@@ -1326,8 +1336,10 @@ async function recapTurn(ctx, agent, seq, signal) {
   } catch { /* 轻量路由未配置则沿用前台路由 */ }
   if (!route) return;
   recapLog('info', 'trigger provider=' + route.provider + ' model=' + route.model);
-  const llm = ctx && ctx.llm;
-  if (!llm || typeof llm.stream !== 'function') return;
+  __nebTrace('recap trigger ' + route.provider + '/' + route.model + ' key=' + key);
+  const llm = ctx && (ctx.llm || (typeof ctx.get === 'function' ? ctx.get('llm') : undefined));
+  __nebTrace('recap llm=' + (!!llm) + ' hasStream=' + (!!(llm && typeof llm.stream === 'function')));
+  if (!llm || typeof llm.stream !== 'function') { __nebTrace('recap no llm -> abort'); return; }
   const controller = new AbortController();
   const abortAll = () => { try { controller.abort(); } catch {} };
   if (signal) { if (signal.aborted) abortAll(); else signal.addEventListener('abort', abortAll, { once: true }); }
@@ -1372,11 +1384,14 @@ async function recapTurn(ctx, agent, seq, signal) {
       } catch { captured = ''; }
     }
     if (!captured && text.trim()) captured = text.trim();
+    __nebTrace('recap stream end finish=' + finishKind + ' textLen=' + text.length + ' tool=' + toolName + ' argsLen=' + toolArgs.length);
     if (captured) {
+      __nebTrace('recap captured ' + captured.length + ' chars');
       recapLog('info', 'captured ' + captured.length + ' chars outcome=' + (outcome || '未标注'));
       await captureRecap(key, captured, outcome);
     }
   } catch (error) {
+    __nebTrace('recap failed: ' + (error instanceof Error ? error.message : String(error)));
     recapLog('warn', 'failed: ' + (error instanceof Error ? error.message : String(error)));
   } finally {
     clearTimeout(timer);
@@ -1427,13 +1442,14 @@ function recapText(kept, ptrs, recapBlockText) {
 // Plugin entry
 // ---------------------------------------------------------------------------
 
-export const inject = ['agents'];
+export const inject = ['agents', 'llm'];
 
 export function apply(ctx) {
   const pendingByAgent = new Map(); // agent session id -> { promise, startedAt, text, consumed }
   const agentDisposers = new Map(); // agent session id -> () => void
 
   const startRecall = (agentSessionId, text) => {
+    __nebTrace('startRecall key=' + agentSessionId + ' q=' + String(text).slice(0, 40));
     let queryText = text;
     // 查询侧 recap 增强: 上一轮总结尾部拼在消息前面, 让代词型短消息也能撞上历史语义
     // (若 recap 尚未到达, pre-step 侧有等待补发逻辑兜底)
@@ -1459,33 +1475,39 @@ export function apply(ctx) {
 
   const attachAgent = (agent) => {
     const key = agent.session.id;
-    if (agentDisposers.has(key)) return;
+    const prev = agentDisposers.get(key);
+    __nebTrace('attachAgent key=' + key + ' sameAgent=' + (prev && prev.agent === agent));
+    if (prev && prev.agent === agent) return;
+    if (prev) { agentDisposers.delete(key); try { prev.dispose(); } catch {} }
     turnState.set(key, { firstTurnAt: Date.now(), turnCount: 0, lastSourceWasUser: false, lastUserText: '' });
     const offInserted = agent.ctx.on('agent/inbox/inserted', ({ message }) => {
       if (!PREFETCH_ENABLED) return;
       if (message?.source?.kind !== 'user') return;
       const text = extractText(message.content);
-      if (text.length < PREFETCH_MIN_QUERY_CHARS) return;
+      __nebTrace('inserted kind=' + (message && message.source && message.source.kind) + ' len=' + text.length);
+      if (!text || text.length < PREFETCH_MIN_QUERY_CHARS) return;
       startRecall(key, text);
     });
     const offPreStep = agent.ctx.on('agent/pre-step', async (payload, next) => {
       const decision = await next();
       if (decision.kind !== 'enter') return decision;
       const st = pendingByAgent.get(key);
+      __nebTrace('prestep key=' + key + ' kind=' + decision.kind + ' pending=' + !!st);
       if (!st) return decision;
       if (Date.now() - st.startedAt > PREFETCH_STALE_MS) {
         pendingByAgent.delete(key);
         return decision;
       }
       const remaining = Math.max(0, st.startedAt + PREFETCH_WAIT_MS - Date.now());
-      const budget = Math.min(remaining, 2500);
+      const budget = Math.min(remaining, 7000);
       const [memItems, sessItems] = await Promise.all([
         Promise.race([st.memPromise, sleep(budget, payload.signal).then(() => null)]),
         Promise.race([st.sessPromise, sleep(Math.min(budget, PREFETCH_SESSION_BUDGET_MS + 500), payload.signal).then(() => null)]),
       ]);
       const memReady = Array.isArray(memItems);
       const sessReady = Array.isArray(sessItems);
-      if (!memReady && !sessReady) return decision; // 两腿都在途: 后续 step 再取
+      __nebTrace('prestep-ready memReady=' + memReady + '(' + (memItems ? memItems.length : 'null') + ') sessReady=' + sessReady + '(' + (sessItems ? sessItems.length : 'null') + ')');
+      if (!memReady) { __nebTrace('mem not ready -> 等下一步'); return decision; } // 记忆腿未就绪: 不空注入, 后续 step 再取
       // recap 迟到补发: 两腿已就绪但 recap 刚好到达, 再给它一个短窗口重发查询
       if (!recapQuerySeen.has(key) && recapQueryTail.has(key) && Date.now() - st.startedAt < RECAP_QUERY_DELAY_MS) {
         const tail = recapQueryTail.get(key) || '';
@@ -1505,6 +1527,7 @@ export function apply(ctx) {
         recapBlockText = recapBuf.get(key) || '';
         pendingRecall.delete(key);
       }
+      __nebTrace('inject? kept=' + kept.length + ' ptrs=' + ptrs.length + ' recap=' + recapBlockText.length);
       if (kept.length === 0 && ptrs.length === 0 && !recapBlockText) return decision;
       if (recapBlockText) recapProbe.set(key, { text: recapBlockText, at: Date.now() });
       const message = createUserMessage({
@@ -1534,7 +1557,7 @@ export function apply(ctx) {
         recapProbe.delete(key);
       }
     });
-    agentDisposers.set(key, () => {
+    agentDisposers.set(key, { agent, dispose: () => {
       offInserted?.();
       offPreStep?.();
       offTurnStopping?.();
@@ -1544,7 +1567,7 @@ export function apply(ctx) {
       recapQueryTail.delete(key);
       recapQuerySeen.delete(key);
       recapProbe.delete(key);
-    });
+    } });
   };
 
   ctx.effect(() => {
@@ -1562,10 +1585,10 @@ export function apply(ctx) {
       attachAgent(agent);
     });
     const offDisposed = ctx.on('agent/disposed', ({ agent }) => {
-      const dispose = agentDisposers.get(agent.session.id);
-      if (dispose) {
+      const entry = agentDisposers.get(agent.session.id);
+      if (entry && entry.agent === agent) {
         agentDisposers.delete(agent.session.id);
-        dispose();
+        entry.dispose();
       }
     });
     for (const agent of ctx.agents.list()) attachAgent(agent);
@@ -1576,7 +1599,7 @@ export function apply(ctx) {
     return () => {
       offCreated?.();
       offDisposed?.();
-      for (const dispose of agentDisposers.values()) dispose();
+      for (const e of agentDisposers.values()) e.dispose();
       agentDisposers.clear();
       pendingByAgent.clear();
       outboxStop();

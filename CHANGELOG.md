@@ -10,6 +10,30 @@
 
 （无）
 
+## [1.3.1] — 2026-11-17
+
+### Fixed — 自动召回 / recap / 查询增强全链路
+
+- **钩子丢失（首轮后不再注入）**：`attachAgent` 原先按 `session.id` 去重，宿主 resume/compaction 重建 agent 实例后（同 session id）旧守卫直接 return，新实例挂不上 `agent/inbox/inserted` / `agent/pre-step` 钩子。改为按 agent 实例判重（`agentDisposers` 存 `{ agent, dispose }`），新实例先释放旧钩子再重挂；`agent/disposed` 按实例匹配。
+- **路由排序**：`routeOrder` 把「未知延迟」地址排在最前，导致首次成功后不可达的 fallback 被优先尝试、吃满预算。改为未知延迟排最后，保留已知最快优先。
+- **空注入**：记忆腿超时（`memReady=false`）时直接以 `kept=0` 返回并丢弃 pending；改为等下一步重试，不空注入。
+- **recap 不生效**：`recapTurn` 用 `ctx.llm` 取不到 LLM 服务（插件上下文为 undefined）→ 静默退出。改为 `ctx.get('llm')` 并 `inject: ['llm']`。
+- **短消息不召回 / 不 recap**：`PREFETCH_MIN_QUERY_CHARS` / `RECAP_MIN_CHARS` 由 8 降为 0（保留空文本保护），「继续」「再试一次」这类消息也触发召回与轮末总结，recap 与查询增强对短消息真正生效。
+- **超时预算按老硬件放宽**：预取等待 7s、单次 race 7s、召回总预算 10s、单路由 8s、会话腿 7s、搜索工具 15s、stats/health 12s（联想老本 embedding+rerank 实测需 7~8s）。写入仍走异步 outbox，不阻塞交互。
+
+### Added
+
+- 可选调试插桩：设置环境变量 `NEBULA_TRACE_FILE=<路径>` 时输出召回/路由/recap 全链路 trace（默认关闭，零开销）。
+
+### 升级影响
+
+- 无破坏：配置、存储、对外工具签名不变。
+- 装完需重启宿主进程加载新代码（模块代际为进程级）。
+
+### 最佳配置建议
+
+- 同前置版本；低功耗设备保持 1.3.1 的超时默认值即可。
+
 ---
 
 ## [1.3.0] — 2026-11-16
