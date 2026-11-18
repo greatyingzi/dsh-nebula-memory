@@ -153,6 +153,111 @@ const OUTBOX_BATCH = 10;                     // 每拍批量补传条数 (/api/m
 const OUTBOX_RECENT_KEYS = 100;              // 已送达 key 的近期去重集容量
 const OUTBOX_DROPPED_KEEP_LINES = 200;       // dropped 审计文件保留行数
 
+// --- 负反馈闭环 (v1.4.0) ---
+// recap 辅助轮里让模型对本轮注入的知识逐条打分; 插件按查询主题条件降权 + 上报服务端。
+const FEEDBACK_ENABLED = true;
+const FEEDBACK_NEG_BELOW = 0.4;        // score < 0.4 → 负反馈
+const FEEDBACK_POS_ABOVE = 0.7;        // score >= 0.7 → 正反馈(恢复权重)
+const FEEDBACK_NEG_FACTOR = 0.6;       // 每次负反馈乘法系数
+const FEEDBACK_POS_FACTOR = 1.25;      // 每次正反馈乘法系数
+const FEEDBACK_MIN_FACTOR = 0.12;      // 降权下限(不彻底拉黑)
+const FEEDBACK_MAX_FACTOR = 1.0;       // 不超过原始分
+const FEEDBACK_TOPIC_JACCARD = 0.3;    // 条件匹配门槛: 当前 query 与历史反馈 token 的 Jaccard
+const FEEDBACK_TOPIC_TOKENS = 28;      // 单条最多保留的主题 token 数
+const FEEDBACK_REVIEW_CHARS = 220;     // recap 给模型看的每条知识摘要长度
+const FEEDBACK_MAX_ITEMS = 6;          // recap 最多评分条数
+const FEEDBACK_LOG_NAME = 'nebula-feedback.jsonl';
+const FEEDBACK_LOG_KEEP = 3000;        // 本地审计日志保留行数
+const BUDGET_FEEDBACK_MS = 5000;       // 服务端上报预算(失败静默)
+
+let feedbackRecords = [];              // {id, tokens, useful, score, ts, query}
+let feedbackLoadedAt = 0;
+let recentTokens = [];                 // 最近一次用户查询的主题 token(显式工具兜底)
+
+function feedbackLogPath() { return join(dshHome(), FEEDBACK_LOG_NAME); }
+
+/** 主题 token: ASCII 复合词 + CJK 二元组。两端同规则, 用于条件降权匹配。 */
+function feedbackTokens(text) {
+  const s = String(text || '').toLowerCase();
+  const out = new Set();
+  for (const m of s.matchAll(/[a-z0-9][a-z0-9_.\-/]{2,}/g)) out.add(m[0]);
+  for (const seg of (s.match(/[\u4e00-\u9fff]+/g) || [])) {
+    for (let i = 0; i + 1 < seg.length; i += 1) out.add(seg.slice(i, i + 2));
+  }
+  return [...out].slice(0, FEEDBACK_TOPIC_TOKENS);
+}
+
+function tokenJaccard(a, b) {
+  if (!a.length || !b.length) return 0;
+  const sa = new Set(a);
+  const sb = new Set(b);
+  let inter = 0;
+  for (const t of sa) if (sb.has(t)) inter += 1;
+  return inter / (sa.size + sb.size - inter);
+}
+
+async function loadFeedbackRecords() {
+  if (feedbackLoadedAt && Date.now() - feedbackLoadedAt < 60_000) return;
+  feedbackLoadedAt = Date.now();
+  try {
+    const txt = await readFile(feedbackLogPath(), 'utf8');
+    feedbackRecords = txt.split('\n').filter(Boolean).map((line) => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean).slice(-FEEDBACK_LOG_KEEP);
+  } catch {
+    feedbackRecords = [];
+  }
+}
+
+/** 某条记忆 + 当前查询主题的降权系数 (乘法, 1 = 不变)。 */
+async function feedbackFactor(id, queryTokens) {
+  if (!FEEDBACK_ENABLED || !id) return 1;
+  await loadFeedbackRecords();
+  let f = 1;
+  for (const rec of feedbackRecords) {
+    if (rec.id !== id || !Array.isArray(rec.tokens)) continue;
+    if (tokenJaccard(queryTokens, rec.tokens) < FEEDBACK_TOPIC_JACCARD) continue;
+    const useful = rec.useful === true || Number(rec.score) >= FEEDBACK_POS_ABOVE;
+    f *= useful ? FEEDBACK_POS_FACTOR : FEEDBACK_NEG_FACTOR;
+  }
+  return Math.min(FEEDBACK_MAX_FACTOR, Math.max(FEEDBACK_MIN_FACTOR, f));
+}
+
+/** 召回结果按反馈降权重排。 */
+async function applyFeedback(items, query) {
+  if (!FEEDBACK_ENABLED || !items.length) return items;
+  const qt = feedbackTokens(query);
+  const out = [];
+  for (const it of items) {
+    const f = await feedbackFactor(it.id, qt);
+    out.push({ ...it, rawScore: it.score, feedbackFactor: f,
+      score: typeof it.score === 'number' ? it.score * f : it.score });
+  }
+  out.sort((a, b) => (b.score || 0) - (a.score || 0));
+  return out;
+}
+
+/** 写一条反馈: 本地 JSONL(审计+即时生效) + 异步上报服务端(跨设备)。 */
+async function recordFeedback(id, score, query, queryTokens) {
+  if (!FEEDBACK_ENABLED || !id || typeof score !== 'number') return;
+  const useful = score >= FEEDBACK_POS_ABOVE;
+  const negative = score < FEEDBACK_NEG_BELOW;
+  if (!useful && !negative) return; // 中间分不动权重
+  const tokens = Array.isArray(queryTokens) && queryTokens.length ? queryTokens : recentTokens;
+  const rec = { id, score, useful, tokens, ts: Date.now(), query: String(query || '').slice(0, 160) };
+  feedbackRecords.push(rec);
+  if (feedbackRecords.length > FEEDBACK_LOG_KEEP) {
+    feedbackRecords.splice(0, feedbackRecords.length - FEEDBACK_LOG_KEEP);
+  }
+  try {
+    await appendFile(feedbackLogPath(), JSON.stringify(rec) + '\n', 'utf8');
+  } catch { /* 本地审计失败不影响主流程 */ }
+  __nebTrace('feedback ' + id + ' score=' + score + ' useful=' + useful);
+  void nebulaApi('POST', '/api/memories/feedback', {
+    id, score, useful, tokens, query: rec.query,
+  }, BUDGET_FEEDBACK_MS).catch(() => {});
+}
+
 const UNCONFIGURED_HINT =
   '星云未配置：设置环境变量 NEBULA_BASE_URL，或创建 ~/.dsh/nebula-memory.json 写入 ' +
   '{"base_url":"http://<星云主机>:9200","fallback_url":"<备用地址>","token":"<64位hex>"}' +
@@ -797,6 +902,19 @@ const RECAP_RETURN_SCHEMA = {
     properties: {
       content: { type: 'string', description: '本次会话轮收尾总结: 任务/关键结论与决策(含数字、配置值)/未完成事项/下一步推进方向/3-6个检索关键词。500字内, 自含, 不引用本机路径。' },
       outcome: { type: 'string', enum: ['done', 'partial', 'blocked', 'noconclusion'], description: '本轮完成度: done=达成 / partial=部分完成 / blocked=受阻 / noconclusion=无明确结论。' },
+      ratings: {
+        type: 'array',
+        description: '对本轮注入的知识逐条打用处分。必须覆盖【本轮召回的知识】里列出的每个 id；漏评的条目保持原权重。',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', description: '注入条目 id，原样复制，不要改写。' },
+            score: { type: 'number', description: '0..1: 1=确实帮上忙 / 0.5=有点相关但没帮上 / 0=完全没用或误导。' },
+          },
+          required: ['id', 'score'],
+        },
+      },
     },
     required: ['content'],
   },
@@ -832,6 +950,50 @@ const recapReturnTool = {
     } catch (error) {
       return { ok: true, queued: true, error: 'queue: ' + (error instanceof Error ? error.message : String(error)) };
     }
+  },
+};
+
+const nebulaFeedbackTool = {
+  name: 'nebula_feedback',
+  description: '显式反馈某条召回知识的用处: 打 0..1 分。0=完全没用/误导, 1=确实有用。低于 0.4 降低它与当前话题的关联度, 高于 0.7 恢复; 通常由 recap 轮自动完成, 这里用于模型主动纠正。',
+  parameters: {
+    type: 'object',
+    additionalProperties: true,
+    properties: {
+      id: { type: 'string', description: '知识条目 id（来自召回注入或 nebula_search）' },
+      score: { type: 'number', description: '0..1 用处分' },
+      query: { type: 'string', description: '当前查询/话题, 用于按主题条件降权; 不传则用最近一次查询。' },
+    },
+    required: ['id', 'score'],
+  },
+  timeoutMs: 10_000,
+  output: {
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ok: { type: 'boolean' },
+        id: { type: 'string' },
+        useful: { type: 'boolean' },
+        error: { type: 'string' },
+      },
+      required: ['ok'],
+    },
+    render: (_args, value) => [{
+      type: 'text',
+      text: value.ok
+        ? ('已记录反馈: ' + value.id + (value.useful ? ' (有用, 提权)' : ' (没用, 降权)'))
+        : ('反馈失败: ' + ((value && value.error) || '未知原因')),
+    }],
+  },
+  async execute(args) {
+    const id = String(args?.id || '').trim();
+    const sc = Number(args?.score);
+    if (!id || !Number.isFinite(sc)) return { ok: false, error: 'id 和 0..1 的 score 必填' };
+    const score = Math.max(0, Math.min(1, sc));
+    const q = String(args?.query || '');
+    await recordFeedback(id, score, q, q ? feedbackTokens(q) : recentTokens);
+    return { ok: true, id, useful: score >= FEEDBACK_POS_ABOVE };
   },
 };
 
@@ -1208,10 +1370,12 @@ async function recallMemLeg(query) {
   const res = await nebulaApi('GET', '/api/memories/search?q=' + q + '&limit=' + (PREFETCH_LIMIT + 2), undefined, BUDGET_RECALL_MS).catch((e) => { __nebTrace('ERR memSearch: ' + (e && e.message || e)); return {}; });
   const body = res.json;
   if (!body || body.ok !== true || !Array.isArray(body.items)) return [];
-  return body.items
+  const kept = body.items
     .filter((it) => typeof it.score === 'number' && it.score >= PREFETCH_MIN_SCORE)
     .sort((a, b) => b.score - a.score)
-    .slice(0, PREFETCH_LIMIT);
+    .slice(0, PREFETCH_LIMIT + 2);
+  const ranked = await applyFeedback(kept, query); // 负反馈: 按查询主题条件降权
+  return ranked.slice(0, PREFETCH_LIMIT);          // 被降权的条目让位给其他候选
 }
 
 async function recallSessionLeg(query) {
@@ -1268,6 +1432,7 @@ const pendingRecall = new Set(); // 有 recap 待下轮召回消费的 agent ses
 const recapQueryTail = new Map(); // agent session id -> recap 摘要尾部(检索查询增强用)
 const recapQuerySeen = new Set(); // 已消费过查询增强的会话(防重复)
 const recapProbe = new Map();    // key -> {text, at} 最近一次注入的 recap(供下轮 consumed 观测)
+const injectedByAgent = new Map(); // key -> {items, query, tokens, at} 本轮注入的知识, 供 recap 轮打分反馈
 let recapReqSeq = 0;             // recap 请求序号(新请求使旧请求流失效)
 let recapInflight = false;       // 同一时刻只允许一个 recap 请求
 let activeRecapKey = '';         // 当前 recap 请求所属会话(回调工具兜底用)
@@ -1277,13 +1442,13 @@ function recapLog(kind, msg) {
   if (kind === 'warn') console.warn(line); else console.info(line);
 }
 
-function recapPrompt(userText, asstTail, nebulaSid) {
+function recapPrompt(userText, asstTail, nebulaSid, injected) {
   const user = String(userText || '').slice(0, RECAP_USER_SNIPPET);
   const asst = String(asstTail || '').slice(-RECAP_ASST_SNIPPET);
   const lines = [
     '[nebula recap 轮] 主对话刚刚结束。这是收尾总结请求, 不属于主对话:',
     '你的输出不会被用户看到, 也不会写入主会话历史。',
-    '唯一动作: 调用一次工具 nebula_recap_return, 在 content 参数给出收尾总结, 并给 outcome 完成度(done/partial/blocked/noconclusion); 不要调用其他工具, 不要输出多余正文。',
+    '唯一动作: 调用一次工具 nebula_recap_return, 在 content 给出收尾总结, 在 outcome 给完成度(done/partial/blocked/noconclusion), 并在 ratings 里对本轮注入的知识逐条打分; 不要调用其他工具, 不要输出多余正文。',
     '',
     'content 要求(500字内, 自含, 不引用本机路径): 1)本轮任务/问题一句话; 2)关键结论/决策/配置值(有数字给数字); 3)未完成事项与下一步; 4)3-6个检索关键词。',
     '',
@@ -1291,6 +1456,14 @@ function recapPrompt(userText, asstTail, nebulaSid) {
     '【助手最后回答(尾部)】' + (asst || '(无)'),
   ];
   if (nebulaSid) lines.push('【关联会话ID】' + nebulaSid);
+  if (injected && Array.isArray(injected.items) && injected.items.length) {
+    lines.push('', '【本轮召回的知识 — 请逐条给 ratings 打分(必填)】');
+    injected.items.forEach((it, i) => {
+      const sc = typeof it.score === 'number' ? it.score.toFixed(2) : '?';
+      lines.push((i + 1) + '. id=' + it.id + ' [相似度 ' + sc + '] ' + it.content);
+    });
+    lines.push('评分: 1=确实帮上本轮回答 / 0.5=有点相关但没帮上 / 0=完全没用或误导; 每个 id 都要给分。');
+  }
   return lines.join('\n');
 }
 
@@ -1322,6 +1495,7 @@ function lastAssistantTail(agent, want) {
 /** recap 请求器: 独立辅助 LLM 调用, 解析 tool-call/text, 捕获总结。 */
 async function recapTurn(ctx, agent, seq, signal) {
   const key = agent.session.id;
+  const injected = injectedByAgent.get(key); // 本轮注入的知识, 供 ratings 打分
   const ts = turnState.get(key);
   if (!ts || seq !== recapReqSeq) return;
   let route = null;
@@ -1346,7 +1520,7 @@ async function recapTurn(ctx, agent, seq, signal) {
   const timer = setTimeout(abortAll, RECAP_BUDGET_MS);
   activeRecapKey = key;
   try {
-    const messages = [{ role: 'user', content: [{ type: 'text', text: recapPrompt(ts.lastUserText, lastAssistantTail(agent, RECAP_ASST_SNIPPET), key) }] }];
+    const messages = [{ role: 'user', content: [{ type: 'text', text: recapPrompt(ts.lastUserText, lastAssistantTail(agent, RECAP_ASST_SNIPPET), key, injected) }] }];
     const options = {
       provider: route.provider,
       model: route.model,
@@ -1361,6 +1535,7 @@ async function recapTurn(ctx, agent, seq, signal) {
     let toolName = '';
     let toolArgs = '';
     let outcome = '';
+    let ratings = [];
     let finishKind = '';
     for await (const chunk of llm.stream(options)) {
       if (seq !== recapReqSeq) return;
@@ -1381,6 +1556,7 @@ async function recapTurn(ctx, agent, seq, signal) {
         const parsed = JSON.parse(toolArgs || '{}');
         captured = String(parsed.content || '').trim();
         outcome = String(parsed.outcome || '').trim();
+        if (Array.isArray(parsed.ratings)) ratings = parsed.ratings;
       } catch { captured = ''; }
     }
     if (!captured && text.trim()) captured = text.trim();
@@ -1389,6 +1565,20 @@ async function recapTurn(ctx, agent, seq, signal) {
       __nebTrace('recap captured ' + captured.length + ' chars');
       recapLog('info', 'captured ' + captured.length + ' chars outcome=' + (outcome || '未标注'));
       await captureRecap(key, captured, outcome);
+    }
+    // 负反馈: 用 recap 轮给的 ratings 对本轮注入的知识打分并写回
+    if (injected) {
+      injectedByAgent.delete(key);
+      const valid = new Set(injected.items.map((it) => it.id));
+      let rated = 0;
+      for (const r of ratings) {
+        const id = String((r && r.id) || '');
+        const sc = Number(r && r.score);
+        if (!valid.has(id) || !Number.isFinite(sc)) continue; // 只接受本轮真实注入的 id
+        await recordFeedback(id, Math.max(0, Math.min(1, sc)), injected.query, injected.tokens);
+        rated += 1;
+      }
+      if (rated) recapLog('info', 'feedback ' + rated + '/' + ratings.length + ' 条已评分');
     }
   } catch (error) {
     __nebTrace('recap failed: ' + (error instanceof Error ? error.message : String(error)));
@@ -1450,6 +1640,7 @@ export function apply(ctx) {
 
   const startRecall = (agentSessionId, text) => {
     __nebTrace('startRecall key=' + agentSessionId + ' q=' + String(text).slice(0, 40));
+    recentTokens = feedbackTokens(text);
     let queryText = text;
     // 查询侧 recap 增强: 上一轮总结尾部拼在消息前面, 让代词型短消息也能撞上历史语义
     // (若 recap 尚未到达, pre-step 侧有等待补发逻辑兜底)
@@ -1529,6 +1720,19 @@ export function apply(ctx) {
       }
       __nebTrace('inject? kept=' + kept.length + ' ptrs=' + ptrs.length + ' recap=' + recapBlockText.length);
       if (kept.length === 0 && ptrs.length === 0 && !recapBlockText) return decision;
+      // 记录本轮注入的知识, 供 recap 辅助轮逐条打分反馈
+      if (kept.length) {
+        injectedByAgent.set(key, {
+          items: kept.slice(0, FEEDBACK_MAX_ITEMS).map((it) => ({
+            id: String(it.id || ''),
+            score: it.score,
+            content: truncate(String(it.content || ''), FEEDBACK_REVIEW_CHARS),
+          })).filter((it) => it.id),
+          query: st.text,
+          tokens: feedbackTokens(st.text),
+          at: Date.now(),
+        });
+      }
       if (recapBlockText) recapProbe.set(key, { text: recapBlockText, at: Date.now() });
       const message = createUserMessage({
         content: [{ type: 'text', text: recapText(kept, ptrs, recapBlockText) }],
@@ -1567,6 +1771,7 @@ export function apply(ctx) {
       recapQueryTail.delete(key);
       recapQuerySeen.delete(key);
       recapProbe.delete(key);
+      injectedByAgent.delete(key);
     } });
   };
 
@@ -1579,6 +1784,7 @@ export function apply(ctx) {
       scope.tools.register(nebulaStatsTool);
       scope.tools.register(nebulaOutboxTool);
       scope.tools.register(recapReturnTool);
+      scope.tools.register(nebulaFeedbackTool);
     });
 
     const offCreated = ctx.on('agent/created', ({ agent }) => {

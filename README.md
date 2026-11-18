@@ -3,8 +3,9 @@
 把私有知识星云（Nebula，SQLite + FAISS + BGE-M3 自建 RAG 知识库）接入 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness)。
 
 - **自动召回**：每条真实用户消息进会话即在星云语义检索，相关记忆（余弦 ≥0.72，top-3）+ **会话指针行**（RRF 融合，top-2）在下一 step 边界自动拼进上下文——不打工具、零操作，模型直接"记得"跨设备历史结论。注入块标记 `[星云记忆自动召回]`，源 `{kind:'nebula', form:'recall'}`，可从会话日志追溯。
-- **手动工具**：`nebula_search`（RRF+rerank 融合检索）/ `nebula_session_search`（四端历史会话切段检索）/ `nebula_session_read`（按 session_id 下钻整段会话）/ `nebula_add`（**异步入队，永不失败**）/ `nebula_stats`（健康规模）/ `nebula_outbox`（队列管理）。
+- **手动工具**：`nebula_search`（RRF+rerank 融合检索）/ `nebula_session_search`（四端历史会话切段检索）/ `nebula_session_read`（按 session_id 下钻整段会话）/ `nebula_add`（**异步入队，永不失败**）/ `nebula_stats`（健康规模）/ `nebula_outbox`（队列管理）/ `nebula_feedback`（显式给某条召回知识打用处分，触发条件降权）。
 - **轮末 recap（v1.3.0）**：主轮结束后插件自主发起一次独立辅助 LLM 请求（工具回调 `nebula_recap_return` 交总结，带 `outcome` 完成度），总结入队星云并按会话 ID 关联；下一条用户消息召回时**注入侧**拼「[上一轮 recap 摘要]」块、**查询侧**把 recap 尾部拼进检索 query——代词型短消息（「继续」「那怎么办」）也能召回上一轮话题。主会话历史零写入，KV cache 零影响。详见 [CHANGELOG v1.3.0](CHANGELOG.md)。
+- **检索负反馈（v1.4.0）**：recap 轮同时对本轮召回的知识逐条打分（`ratings`：1=帮上 / 0.5=没帮上 / 0=误导），低分按**查询主题条件降权**（本地即时生效 + 上报服务端跨设备生效）；也可随时用 `nebula_feedback` 工具显式纠正。详见 [CHANGELOG v1.4.0](CHANGELOG.md)。
 - **写入队列**：断网/抖动时写入先固化本地 JSONL，后台批量补传，指数退避，容量受控（详见 [CHANGELOG v1.1.0](CHANGELOG.md)）。
 - **多路由 failover**：主+备地址，失败冷却 30s、按实测延迟排序、总预算内快速失败。
 - **零内嵌端点**：包内无任何 IP/域名/token，**每台设备装后自配**。

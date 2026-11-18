@@ -10,6 +10,25 @@
 
 （无）
 
+## [1.4.0] — 2026-11-18
+
+### Added — 检索负反馈闭环（recap 打分 → 按主题条件降权）
+
+- **recap 轮逐条打分**：`nebula_recap_return` 工具新增 `ratings` 参数（数组 `{id, score 0..1}`）。recap prompt 列出本轮注入的知识（id + 相似度 + 220 字摘要），要求逐条给用处分：1=确实帮上 / 0.5=有点相关但没帮上 / 0=完全没用或误导。只接受本轮真实注入的 id，防模型幻觉。
+- **按查询主题条件降权**：本地 `~/.dsh/nebula-feedback.jsonl` 记评分与主题 token（ASCII 复合词 + CJK bigram）；召回时对同一记忆、主题 Jaccard ≥0.3 的历史评分做乘法衰减（负 0.6 / 正 1.25，下限 0.12），降权重排后再取 top-3——被判没用的让位给其他候选，换主题不误伤。
+- **显式反馈工具** `nebula_feedback({id, score, query?})`：模型可在非 recap 轮主动纠正某条知识的用处分。
+- **服务端配合**：每条反馈异步 `POST /api/memories/feedback`；Rust 端 `memory_feedback` 表 + 检索排序惩罚，跨设备生效。
+
+### 升级影响
+
+- 需 nebula-sync 服务端同步升级（新接口 404 时上报静默失败，本地降权仍独立生效）。
+- 新增本地文件 `~/.dsh/nebula-feedback.jsonl`（append-only，3000 行上限）。
+- 装完需重启宿主进程加载新代码（模块代际为进程级）。
+
+### 最佳配置建议
+
+- 打分门槛与衰减系数目前为内置常量（0.4 / 0.7 / 0.6 / 1.25）；先跑一周观察 `nebula-feedback.jsonl` 的正负分布再调。
+
 ## [1.3.1] — 2026-11-17
 
 ### Fixed — 自动召回 / recap / 查询增强全链路
