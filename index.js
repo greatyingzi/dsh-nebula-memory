@@ -229,9 +229,16 @@ async function applyFeedback(items, query) {
   const qt = feedbackTokens(query);
   const out = [];
   for (const it of items) {
-    const f = await feedbackFactor(it.id, qt);
-    out.push({ ...it, rawScore: it.score, feedbackFactor: f,
-      score: typeof it.score === 'number' ? it.score * f : it.score });
+    // 服务端 /api/memories/search 已应用降权并返回 feedback_factor:
+    // 这里只重排不再乘, 避免双重降权(0.6→0.36); 离线/旧服务端回退到本地计算。
+    const sf = typeof it.feedback_factor === 'number' ? it.feedback_factor : null;
+    const f = sf !== null ? sf : await feedbackFactor(it.id, qt);
+    const score = typeof it.score === 'number' ? it.score : 0;
+    out.push({ ...it,
+      rawScore: sf !== null && f > 0 ? score / f : (it.rawScore !== undefined ? it.rawScore : score),
+      feedbackFactor: f,
+      feedback_factor: f,
+      score: sf !== null ? score : score * f });
   }
   out.sort((a, b) => (b.score || 0) - (a.score || 0));
   return out;
