@@ -6,9 +6,66 @@
 
 ---
 
-## [Unreleased]
+## [1.6.0] — 2026-11-20
 
-（无）
+### Added — 注入前精排（fork-from-main precision rerank）
+
+- **打分前移**：把原先轮末 recap 的「打分后决定保留」前移到注入之前。粗召回由 3 条放大到 12 条候选；在 `agent/pre-step` 里**复用 recap 辅助调用机制**：一次 `llm.stream` + 单条用户消息，消息里带当前用户消息、上一轮助手回答尾部、上一轮 recap 摘要 + 候选清单 + 创意任务 rubric，一个回调工具逐条打分。不复制完整会话历史、不写主会话。按**相对排序**取 top-3 全文 + top-2 一行指针，其余丢弃；`wrong`/`outdated` 硬淘汰，不设绝对分数阈值。
+- **零污染**：打分副本不改任何历史消息、不写主会话、不写 `nebula_feedback`（轮末观察到的真实用处仍走原学习回路）。失败 / 超时 / 截断 / 无 provider 一律回退到原向量分 top-3，行为零回归。
+- **成本旋钮与护栏**：候选数 N=12（粗算 7~10 打平、10~15 可行）；预算 8s；`NEBULA_PRECISION=0` 一键跳过；输出强制小 JSON，触顶即弃；按 (query, 候选 id 集合) 缓存 10min / 200 条。
+- **可观测**：`~/.dsh/nebula-precision.jsonl` 记录每次候选数、保留/丢弃 id、逐条 `{id, score, verdict, note}`、来源（scored-recap / cache / fallback）、模型、失败原因；注入块条目显示「精排 x.xx」。
+- **职责边界**：轮首打分只做「估计有用性 / 排除完全无关或与会话偏离的条目」，**不回写星云 feedback**（否则低分条目永不被注入 → 自证循环）；真实用处分仍由轮末 recap 的 ratings 写回 `nebula-feedback.jsonl` 并上报服务端。
+- **护栏**：打分失败/截断/超时一律回退向量 top-3；首轮 `requestHeader` 未生成时从 agent 选项取 provider/model。
+- **新 tunables**：`precisionEnabled / precisionCandidates / precisionTopFull / precisionTopPointer / precisionBudgetMs / precisionReviewChars / precisionProvider / precisionModel`（env `NEBULA_PRECISION_*` 系列或配置 `tunables` 对象）。
+
+### 升级影响
+
+- 每轮多一次 LLM 调用（复用前台路由，或显式配便宜模型），主请求前最多多等 8s；精排失败自动回退。
+- node_modules 内直接改文件不影响当前进程，**需宿主重启**才加载新代码。
+- 回滚：设 `NEBULA_PRECISION=0`，或恢复 `index.js.bak-precision-20261120`。
+
+### 最佳配置建议
+
+- 先跑一周 A/B：量**整场会话净 token**（含后续轮次的缓存读写）、输出质量、端到端延迟；用 `node ~/scripts/nebula-precision-eval.cjs` 看候选数与保留率。
+- **打分沿用主会话的 provider/model**，不另配模型（避免额外路由与缓存代价）。打分请求直接复用 `recapPrompt()` + `RECAP_RETURN_SCHEMA`，与主模型已验证的 recap 调用形态一致。
+- Hunyuan（hy4-flash-free）需要先推理再调用打分工具：实测预算 8s / maxTokens 2400 会超时回退，调到 **20s / 4000** 后稳定命中（12→3+2）。这是沿用主模型的前提下的必要余量，不是专用模型。
+- 延迟敏感就把候选数降到 8~10。
+
+## [1.5.0] — 2026-11-19
+
+### Added — 可调参数 + recap 可靠性 + 轮内错误召回 + 压缩交接
+
+- **可调参数（tunables）**：`$DSH_HOME/nebula-memory.json` 的 `tunables` 对象（兼容 snake_case 键）或 `NEBULA_*` env 在模块加载期同步解析；env 优先于文件，文件优先于默认。导出只读诊断对象 `nebulaTunables` 与纯函数 `resolveTunables` 供自检/测试。
+- **recap 可靠性**：max-tokens 截断不再一律丢弃——优先抢救工具回调中已交回的 `content`，其次用流式正文，两者皆空才弃用（trace 记录抢救日志）；recap prompt 新增 `【本轮工具错误/关键结果】`（最近 1800 字错误/关键 tool/result）与 `【本轮工具调用】`（最近 6 次调用名+截断参数）两段，总长硬性封顶 6000 字。
+- **每用户消息一次查询增强**：`recapQuerySeen` 会话级 Set 移除，`augmented` 标记改存 `pendingByAgent` 条目，同一用户消息不会重复拼 `[上轮话题]`，不同消息可各自增强；recap 摘要被消费后清空 tail。
+- **轮内工具错误召回**：`agent/pre-step` 在工具结果文本命中 error/failed/exception/失败/错误/超时/timeout 时，按最新用户消息 + `[工具错误]` 片段重启 mem/session 两腿召回；同错误签名（前 120 字 hash）本轮只召回一次，每轮上限由 tunable 控制；本 step 不注入，下一 step 用新结果注入（防循环）。
+- **压缩交接（observe-only）**：`session/event` 的 `compaction/start` 同步写 `$DSH_HOME/nebula-compaction-handoff.json` 及每会话副本（摘要器启动前完成），内容为最近 8 条用户/助手文本 + 当前注入记忆的 id/摘要（Memory Continuity 块）；两阶段分别异步入队 outbox（tags `compaction,auto` / `compaction-summary,auto`，后者含 summary 与 shadowedTokenCount）。`compaction/summary` 打标记，下一 `agent/pre-step` 注入 `{kind:'nebula', form:'compaction-handoff'}` 的中文交接块并清标记。不修改 session 对象。
+
+### Tunables（默认值 / env 名）
+
+| 名称 | 默认 | env | 说明 |
+|---|---|---|---|
+| `recapMaxTokens` | 2400 | `NEBULA_RECAP_MAX_TOKENS` | recap 辅助请求输出上限（原 900） |
+| `recapMaxTurns` | 100 | `NEBULA_RECAP_MAX_TURNS` | 单会话 recap 次数上限，0=不限（原 3） |
+| `recapWindowMs` | 0 | `NEBULA_RECAP_WINDOW_MS` | 首轮起的 recap 时间窗，0=不限（原 600000） |
+| `recapQueryChars` | 1200 | `NEBULA_RECAP_QUERY_CHARS` | 拼进检索 query 的 recap 尾部长度（原 800） |
+| `prefetchLimit` | 3 | `NEBULA_PREFETCH_LIMIT` | 每轮注入记忆上限 |
+| `prefetchEntryChars` | 300 | `NEBULA_PREFETCH_ENTRY_CHARS` | 单条注入截断长度 |
+| `intraTurnRecall` | true | `NEBULA_INTRA_TURN_RECALL` | 工具错误触发轮内重召回开关 |
+| `intraTurnRecallMax` | 2 | `NEBULA_INTRA_TURN_RECALL_MAX` | 每轮工具错误重召回上限 |
+| `compactionHandoff` | true | `NEBULA_COMPACTION_HANDOFF` | 压缩交接开关 |
+
+### 升级影响
+
+- 无破坏：工具签名、注入源 `{kind:'nebula', form:'recall'}`、outbox 文件格式不变；新能力均有安全默认。
+- 新本地文件：`~/.dsh/nebula-compaction-handoff.json` 与 `~/.dsh/nebula-compaction-handoff-<sessionId>.json`（每次压缩覆盖写）。
+- 装完需重启宿主进程加载新代码（模块代际为进程级）。
+
+### 最佳配置建议
+
+- 默认放开 recap（100 次/无限窗）是为「学习强」；若成本敏感，用 env 或文件把 `recapMaxTurns` 调回 3、`recapWindowMs` 调回 600000。
+- 成本低的小模型配 `recap_provider`/`recap_model` 承担 2400 token 的 recap；老机器可把 `intraTurnRecallMax` 设 1。
+- 验证：`node --test test/`、`node --check index.js`；压缩前后检查交接文件与 outbox 中 `compaction,auto` 条目。
 
 ## [1.4.1] — 2026-11-18
 

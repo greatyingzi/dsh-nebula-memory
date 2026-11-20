@@ -7,6 +7,7 @@
 - **轮末 recap（v1.3.0）**：主轮结束后插件自主发起一次独立辅助 LLM 请求（工具回调 `nebula_recap_return` 交总结，带 `outcome` 完成度），总结入队星云并按会话 ID 关联；下一条用户消息召回时**注入侧**拼「[上一轮 recap 摘要]」块、**查询侧**把 recap 尾部拼进检索 query——代词型短消息（「继续」「那怎么办」）也能召回上一轮话题。主会话历史零写入，KV cache 零影响。详见 [CHANGELOG v1.3.0](CHANGELOG.md)。
 - **检索负反馈（v1.4.0）**：recap 轮同时对本轮召回的知识逐条打分（`ratings`：1=帮上 / 0.5=没帮上 / 0=误导），低分按**查询主题条件降权**（本地即时生效 + 上报服务端跨设备生效）；也可随时用 `nebula_feedback` 工具显式纠正。详见 [CHANGELOG v1.4.0](CHANGELOG.md)。
 - **写入队列**：断网/抖动时写入先固化本地 JSONL，后台批量补传，指数退避，容量受控（详见 [CHANGELOG v1.1.0](CHANGELOG.md)）。
+- **v1.5.0 增强**：recap 可调参数（配置/env）、max-tokens 截断抢救 + 工具错误证据 prompt、每用户消息一次查询增强、轮内工具错误自动重召回、压缩交接快照与注入。详见 [CHANGELOG v1.5.0](CHANGELOG.md)。
 - **多路由 failover**：主+备地址，失败冷却 30s、按实测延迟排序、总预算内快速失败。
 - **零内嵌端点**：包内无任何 IP/域名/token，**每台设备装后自配**。
 
@@ -73,6 +74,48 @@ dsh plugin --profile <profile> add https://github.com/greatyingzi/dsh-nebula-mem
 | `scope` | string | `nebula_add` 未显式传 scope 时的默认值；可省（服务端默认 `general`） |
 | `recap_provider` | string | 可选。轮末 recap 的轻量路由 provider；配置后**优先于会话前台路由**（recap 是辅助负载，显式配置的便宜/免费模型更合适） |
 | `recap_model` | string | 可选。与 `recap_provider` 成对配置；只配一个时整对不生效 |
+| `tunables.precision_enabled` | bool | 注入前精排总开关，默认 true；env `NEBULA_PRECISION=0` 可跳过 |
+| `tunables.precision_candidates` | int | 粗召回候选数 N，默认 12（成本主旋钮；7~10 打平，10~15 可行） |
+| `tunables.precision_top_full` | int | 精排后保留全文条数，默认 3 |
+| `tunables.precision_top_pointer` | int | 次高分只留指针行的条数，默认 2 |
+| `tunables.precision_budget_ms` | int | 打分调用预算，默认 20000ms（Hunyuan 需要先推理再调工具，8s 会超时）；超时/中断自动回退 |
+| `tunables.precision_review_chars` | int | 评分请求里每条候选摘要长度，默认 220 |
+| 打分模型 | — | 固定沿用主会话 provider/model，不提供专用打分模型开关 |
+| `tunables` | object | 可选。v1.5.0 可调参数（见下表），支持 camelCase 与 snake_case 键；同名字段也可由 `NEBULA_*` env 覆盖，env > 文件 > 默认 |
+
+**tunables 示例**（写进同一份 `~/.dsh/nebula-memory.json`）：
+
+```json
+{
+  "base_url": "http://<星云主机>:9200",
+  "token": "<64位hex>",
+  "tunables": {
+    "recapMaxTokens": 2400,
+    "recapMaxTurns": 100,
+    "recapWindowMs": 0,
+    "recapQueryChars": 1200,
+    "prefetchLimit": 3,
+    "prefetchEntryChars": 300,
+    "intraTurnRecall": true,
+    "intraTurnRecallMax": 2,
+    "compactionHandoff": true
+  }
+}
+```
+
+| tunable | 默认 | env 覆盖 | 含义 |
+|---|---|---|---|
+| `recapMaxTokens` | 2400 | `NEBULA_RECAP_MAX_TOKENS` | recap 输出上限（原 900） |
+| `recapMaxTurns` | 100 | `NEBULA_RECAP_MAX_TURNS` | 单会话 recap 次数，0=不限（原 3） |
+| `recapWindowMs` | 0 | `NEBULA_RECAP_WINDOW_MS` | recap 时间窗 ms，0=不限（原 600000） |
+| `recapQueryChars` | 1200 | `NEBULA_RECAP_QUERY_CHARS` | 拼进检索 query 的 recap 尾部长度 |
+| `prefetchLimit` | 3 | `NEBULA_PREFETCH_LIMIT` | 每轮注入记忆上限 |
+| `prefetchEntryChars` | 300 | `NEBULA_PREFETCH_ENTRY_CHARS` | 单条注入截断长度 |
+| `intraTurnRecall` | true | `NEBULA_INTRA_TURN_RECALL` | 工具错误触发轮内重召回 |
+| `intraTurnRecallMax` | 2 | `NEBULA_INTRA_TURN_RECALL_MAX` | 每轮工具错误重召回上限 |
+| `compactionHandoff` | true | `NEBULA_COMPACTION_HANDOFF` | 压缩交接（同步落盘 + outbox + 下一 step 注入） |
+
+`tunables` 在模块加载期同步读取一次，改完需重启宿主；可用 `import { nebulaTunables } from '@local/nebula-memory'` 查看解析结果，或 `node --test test/` 跑自检。
 
 ### base_url 怎么选（按网络位置）
 
