@@ -1,5 +1,7 @@
 # nebula-memory — 知识星云 × DeepSeek Harness
 
+配套星云后端（可自托管 Docker 一键部署，模型内置）：[nebula-backend](https://github.com/greatyingzi/nebula-backend)。
+
 把私有知识星云（Nebula，SQLite + FAISS + BGE-M3 自建 RAG 知识库）接入 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness)。
 
 - **自动召回**：每条真实用户消息进会话即在星云语义检索，相关记忆（余弦 ≥0.72，top-3）+ **会话指针行**（RRF 融合，top-2）在下一 step 边界自动拼进上下文——不打工具、零操作，模型直接"记得"跨设备历史结论。注入块标记 `[星云记忆自动召回]`，源 `{kind:'nebula', form:'recall'}`，可从会话日志追溯。
