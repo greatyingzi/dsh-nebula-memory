@@ -10,6 +10,7 @@
 - **检索负反馈（v1.4.0）**：recap 轮同时对本轮召回的知识逐条打分（`ratings`：1=帮上 / 0.5=没帮上 / 0=误导），低分按**查询主题条件降权**（本地即时生效 + 上报服务端跨设备生效）；也可随时用 `nebula_feedback` 工具显式纠正。详见 [CHANGELOG v1.4.0](CHANGELOG.md)。
 - **写入队列**：断网/抖动时写入先固化本地 JSONL，后台批量补传，指数退避，容量受控（详见 [CHANGELOG v1.1.0](CHANGELOG.md)）。
 - **v1.5.0 增强**：recap 可调参数（配置/env）、max-tokens 截断抢救 + 工具错误证据 prompt、每用户消息一次查询增强、轮内工具错误自动重召回、压缩交接快照与注入。详见 [CHANGELOG v1.5.0](CHANGELOG.md)。
+- **v1.6.x 注入前精排**：轮首对粗召回候选做一次结构化选择（有序 top-3 全文 + top-2 指针），模型**只回 ID**，不再写总结/分数；解析失败最多重试 3 次（不携带失败输出）。**新会话首轮默认跳过打分**。打分与轮末 recap 两个辅助调用均**关闭思考**。详见 [CHANGELOG v1.6.2](CHANGELOG.md)。
 - **多路由 failover**：主+备地址，失败冷却 30s、按实测延迟排序、总预算内快速失败。
 - **零内嵌端点**：包内无任何 IP/域名/token，**每台设备装后自配**。
 
@@ -77,10 +78,12 @@ dsh plugin --profile <profile> add https://github.com/greatyingzi/dsh-nebula-mem
 | `recap_provider` | string | 可选。轮末 recap 的轻量路由 provider；配置后**优先于会话前台路由**（recap 是辅助负载，显式配置的便宜/免费模型更合适） |
 | `recap_model` | string | 可选。与 `recap_provider` 成对配置；只配一个时整对不生效 |
 | `tunables.precision_enabled` | bool | 注入前精排总开关，默认 true；env `NEBULA_PRECISION=0` 可跳过 |
+| `tunables.precision_skip_first_turn` | bool | 新会话首轮跳过打分，默认 true；env `NEBULA_PRECISION_SKIP_FIRST_TURN=0` 恢复首轮打分 |
+| `tunables.precision_retries` | int | 精排输出解析失败的重试次数（不含首次），默认 3；env `NEBULA_PRECISION_RETRIES` |
 | `tunables.precision_candidates` | int | 粗召回候选数 N，默认 12（成本主旋钮；7~10 打平，10~15 可行） |
 | `tunables.precision_top_full` | int | 精排后保留全文条数，默认 3 |
 | `tunables.precision_top_pointer` | int | 次高分只留指针行的条数，默认 2 |
-| `tunables.precision_budget_ms` | int | 打分调用预算，默认 20000ms（Hunyuan 需要先推理再调工具，8s 会超时）；超时/中断自动回退 |
+| `tunables.precision_budget_ms` | int | 打分调用预算，默认 20000ms（辅助调用已关闭思考；早期开启思考时 8s 会超时）；超时/中断自动回退 |
 | `tunables.precision_review_chars` | int | 评分请求里每条候选摘要长度，默认 220 |
 | 打分模型 | — | 固定沿用主会话 provider/model，不提供专用打分模型开关 |
 | `tunables` | object | 可选。v1.5.0 可调参数（见下表），支持 camelCase 与 snake_case 键；同名字段也可由 `NEBULA_*` env 覆盖，env > 文件 > 默认 |

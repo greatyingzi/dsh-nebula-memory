@@ -35,7 +35,7 @@
  */
 
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -123,6 +123,8 @@ const TUNABLE_SPECS = {
   intraTurnRecallMax:  { env: 'NEBULA_INTRA_TURN_RECALL_MAX',  def: 2,    type: 'int' },
   compactionHandoff:   { env: 'NEBULA_COMPACTION_HANDOFF',    def: true, type: 'bool' },
   precisionEnabled:    { env: 'NEBULA_PRECISION',              def: true, type: 'bool' },
+  precisionSkipFirstTurn: { env: 'NEBULA_PRECISION_SKIP_FIRST_TURN', def: true, type: 'bool' },
+  precisionRetries:      { env: 'NEBULA_PRECISION_RETRIES',         def: 3,    type: 'int' },
   precisionCandidates: { env: 'NEBULA_PRECISION_CANDIDATES',   def: 12,   type: 'int' },
   precisionTopFull:    { env: 'NEBULA_PRECISION_TOP_FULL',     def: 3,    type: 'int' },
   precisionTopPointer: { env: 'NEBULA_PRECISION_TOP_POINTER',   def: 2,    type: 'int' },
@@ -195,17 +197,19 @@ const PREFETCH_STALE_MS = 30_000;     // discard recall older than this
 // 上下文取主会话最近片段(当前用户消息/上一轮回答尾部/recap 摘要), 不复制完整会话历史、不写主会话。
 // 打分只决定"注入哪些"; 不写 nebula_feedback —— 那是轮末观察到真实用处后的学习回路。
 const PRECISION_ENABLED = nebulaTunables.precisionEnabled;                 // NEBULA_PRECISION=0 跳过
+// 新会话首轮没有上一轮助手回答 / recap 摘要可作打分依据, 且实测首轮打分超时率最高 → 默认跳过
+const PRECISION_SKIP_FIRST_TURN = nebulaTunables.precisionSkipFirstTurn;     // NEBULA_PRECISION_SKIP_FIRST_TURN=0 恢复首轮打分
 const PRECISION_CANDIDATES = Math.max(1, nebulaTunables.precisionCandidates); // 粗召回 N —— 成本主旋钮
 const PRECISION_TOP_FULL = Math.max(1, Math.min(PRECISION_CANDIDATES, nebulaTunables.precisionTopFull));
 const PRECISION_TOP_POINTER = Math.max(0, nebulaTunables.precisionTopPointer);
 const PRECISION_REVIEW_CHARS = Math.max(60, nebulaTunables.precisionReviewChars);
-const PRECISION_MAX_TOKENS = 4000;    // Hunyuan 需要先推理再调打分工具, 留足输出空间
-const PRECISION_BUDGET_MS = Math.max(1000, nebulaTunables.precisionBudgetMs); // 超时/中断 → 回退向量分
+const PRECISION_MAX_TOKENS = 4000;    // 实测 800 会让模型在发出工具调用前触顶(no-tool-call/max-tokens); 恢复已知可用的 4000
+const PRECISION_RETRIES = Math.max(0, nebulaTunables.precisionRetries); // 解析失败重试次数(不含首次), 默认 3
+const PRECISION_BUDGET_MS = Math.max(1000, nebulaTunables.precisionBudgetMs); // 所有尝试共享总预算, 超时 → 回退向量分
 const PRECISION_CACHE_TTL_MS = 10 * 60_000;
 const PRECISION_CACHE_MAX = 200;
 const PRECISION_LOG_NAME = 'nebula-precision.jsonl';
 const PRECISION_LOG_KEEP = 3000;
-const PRECISION_DROP_VERDICTS = new Set(['wrong', 'outdated']); // 硬淘汰(非阈值), 其余按相对排序取 top-K
 
 // --- session-RAG 指针腿 (会话段索引, 对齐 hermes MEM_INTERACTION §3.1) ---
 // 与 mem 腿并行、独立预算、失败静默; RRF(k=60) 排名融合取 session 侧 top-N,
@@ -1448,9 +1452,8 @@ function sleep(ms, signal) {
 async function recallMemLeg(query) {
   const routes = await loadRoutes();
   if (routes.length === 0) return []; // 未配置: 静默跳过
-  if (routes.every((b) => (routeFails.get(b) || 0) > Date.now())) {
-    return []; // 所有路由都在冷却期(已知不可达): 不拖慢本轮 pre-step
-  }
+  // v1.6.6: 写队列(outbox)失败也会把路由打入冷却; 读召回不能因此直接返回空,
+  // 否则精排永远拿不到候选。冷却路由仍排在后面尝试, 由请求预算兜底。
   // 纯向量路端点: score = BGE-M3 余弦 (0..1), 与 hermes prefetch 的 0.72 窄带阈值同语义。
   // /search 是 RRF+rerank 融合路, score 为 rerank logit(负值), 不能用过阈值筛。
   const q = encodeURIComponent(query.slice(0, 2000));
@@ -1471,7 +1474,7 @@ async function recallMemLeg(query) {
 async function recallSessionLeg(query) {
   const routes = await loadRoutes();
   if (routes.length === 0) return [];
-  if (routes.every((b) => (routeFails.get(b) || 0) > Date.now())) return [];
+  // v1.6.6: 同 recallMemLeg, 写失败导致的冷却不应让读召回空转
   // 指针腿不走 rerank（独立预算, 不能被精排拖）, preview 只要够拼指针行
   return sessionSearch(query, PREFETCH_SESSION_FETCH, {
     preview: PREFETCH_SESSION_PREVIEW,
@@ -1484,7 +1487,7 @@ function recallText(memItems, ptrs, memPointers) {
   const lines = ['[星云记忆自动召回] 以下条目来自知识星云，与当前输入语义相关，由系统自动注入（不是用户说的话）：'];
   memItems.forEach((it, i) => {
     const score = typeof it.score === 'number' ? it.score.toFixed(2) : '?';
-    const fine = typeof it.precisionScore === 'number' ? ' · 精排 ' + it.precisionScore.toFixed(2) : '';
+    const fine = it.precisionSelected ? ' · 精排选中' : (typeof it.precisionScore === 'number' ? ' · 精排 ' + it.precisionScore.toFixed(2) : '');
     const scope = it.scope ? ` · ${it.scope}` : '';
     lines.push(`${i + 1}. (${score}${fine}${scope}) ${truncate(it.content, PREFETCH_ENTRY_CHARS)}`);
   });
@@ -1598,6 +1601,23 @@ function assistantTextOf(message) {
   } catch { return ''; }
 }
 
+/** 会话是否已有历史轮次: 宿主重启后 turnCount 归零, 不能只靠它判断首轮。 */
+function hasPriorConversation(agent) {
+  try {
+    const session = agent && agent.session;
+    const log = session && Array.isArray(session.log) ? session.log : null;
+    if (!log) return false;
+    let users = 0;
+    for (const ev of log) {
+      const msg = typeof session.deriveEventMessage === 'function' ? session.deriveEventMessage(ev) : null;
+      if (!msg) continue;
+      if (msg.role === 'assistant') return true;
+      if (msg.role === 'user' && ++users >= 2) return true;
+    }
+  } catch { /* 派生失败按新会话保守处理 */ }
+  return false;
+}
+
 /** 从会话日志尾部取最近 assistant 文本(最多数条拼接), 供 recap 请求参考。 */
 function lastAssistantTail(agent, want) {
   try {
@@ -1705,6 +1725,28 @@ function compactionContinuityText(session) {
   return lines.join('\n');
 }
 
+// 交接文件容量护栏: 每会话一份会随会话数/压缩次数无限增长, 按数量+时间双上限清理。
+const HANDOFF_KEEP_MAX = 20;
+const HANDOFF_TTL_MS = 7 * 24 * 3600_000;
+function pruneHandoffFiles(keepPath) {
+  try {
+    const dir = dshHome();
+    const now = Date.now();
+    const files = readdirSync(dir)
+      .filter((n) => /^nebula-compaction-handoff-session-.*\.json$/.test(n))
+      .map((n) => { const p = join(dir, n); return { p, m: statSync(p).mtimeMs }; })
+      .filter((f) => f.p !== keepPath)
+      .sort((a, b) => b.m - a.m);
+    let removed = 0;
+    files.forEach((f, i) => {
+      if (i >= HANDOFF_KEEP_MAX - 1 || now - f.m > HANDOFF_TTL_MS) {
+        try { unlinkSync(f.p); removed += 1; } catch { /* 单文件删除失败不影响主流程 */ }
+      }
+    });
+    if (removed) __nebTrace('compaction handoff pruned ' + removed + ' files');
+  } catch { /* 清理失败不影响写入 */ }
+}
+
 /** 同步落盘交接文件(摘要器启动前必须完成): 全局一份 + 每会话一份。 */
 function writeCompactionHandoff(payload) {
   try {
@@ -1715,6 +1757,7 @@ function writeCompactionHandoff(payload) {
       join(dshHome(), 'nebula-compaction-handoff-' + sid + '.json'),
     ];
     for (const p of paths) writeFileSync(p, data);
+    pruneHandoffFiles(paths[1]);
     __nebTrace('compaction handoff written ' + paths[1]);
     return paths;
   } catch (error) {
@@ -1763,6 +1806,8 @@ async function recapTurn(ctx, agent, seq, signal) {
       messages,
       tools: [RECAP_RETURN_SCHEMA],
       maxTokens: RECAP_MAX_TOKENS,
+      // recap 只做结构化总结/打分, 关闭思考降低延迟与 token 消耗
+      reasoningEffort: 'off',
       sessionId: key,
       purpose: 'nebula-recap',
       signal: controller.signal,
@@ -1842,6 +1887,34 @@ async function recapTurn(ctx, agent, seq, signal) {
   }
 }
 
+// recap 本地持久缓存: 服务重启后仍能给旧会话拼回上一轮话题(星云上传可能失败/滞后)。
+const RECAP_CACHE_NAME = 'nebula-recap-cache.json';
+const RECAP_CACHE_MAX = 100;
+const RECAP_CACHE_TTL_MS = 7 * 24 * 3600_000;
+function recapCachePath() { return join(dshHome(), RECAP_CACHE_NAME); }
+function loadRecapCache() {
+  try {
+    const o = JSON.parse(readFileSync(recapCachePath(), 'utf8'));
+    return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+  } catch { return {}; }
+}
+function saveRecapCache(cache) {
+  try { writeFileSync(recapCachePath(), JSON.stringify(cache)); }
+  catch (e) { __nebTrace('recap cache write failed: ' + (e instanceof Error ? e.message : String(e))); }
+}
+function restoreRecapFromDisk(key) {
+  try {
+    const entry = loadRecapCache()[key];
+    if (!entry || typeof entry.text !== 'string' || !entry.text) return false;
+    if (Date.now() - (entry.at || 0) > RECAP_CACHE_TTL_MS) return false;
+    recapBuf.set(key, entry.text);
+    pendingRecall.add(key);
+    recapQueryTail.set(key, entry.text.slice(-RECAP_QUERY_CHARS));
+    recapLog('info', 'recap restored from disk key=' + key + ' chars=' + entry.text.length);
+    return true;
+  } catch { return false; }
+}
+
 /** 捕获总结: 入队星云(带会话ID+完成度) + 缓存为下轮召回拼接语料。 */
 async function captureRecap(key, content, outcome) {
   const trimmed = String(content || '').slice(0, RECAP_ENTRY_CHARS);
@@ -1851,6 +1924,13 @@ async function captureRecap(key, content, outcome) {
     recapBuf.set(key, trimmed);
     pendingRecall.add(key);
     recapQueryTail.set(key, trimmed.slice(-RECAP_QUERY_CHARS));
+    const cache = loadRecapCache();
+    const now = Date.now();
+    for (const [k, v] of Object.entries(cache)) if (!v || now - (v.at || 0) > RECAP_CACHE_TTL_MS) delete cache[k];
+    cache[key] = { text: trimmed, at: now };
+    const keys = Object.keys(cache);
+    if (keys.length > RECAP_CACHE_MAX) for (const k of keys.slice(0, keys.length - RECAP_CACHE_MAX)) delete cache[k];
+    saveRecapCache(cache);
   }
   try {
     const device = await loadDeviceConfig();
@@ -1884,30 +1964,18 @@ function recapText(kept, ptrs, recapBlockText, memPointers) {
 // 注入前精排 (fork-from-main) — 打分副本 + top-K 选择 + 审计
 // ---------------------------------------------------------------------------
 
+// v1.6.3: 复用模型已熟悉的 nebula_recap_return 工具名, 参数只收选中的 id。
 const PRECISION_SCORE_SCHEMA = {
-  name: 'nebula_precision_return',
-  description: '注入前精排专用回调工具: 对候选记忆逐条打用处分。仅调用一次, 不要调其他工具。',
+  name: 'nebula_recap_return',
+  description: '注入前精排专用回调工具: 从候选清单中选出最有用的记忆, 只返回 id, 不返回分数或总结。',
   parameters: {
     type: 'object',
-    additionalProperties: true,
+    additionalProperties: false,
     properties: {
-      ratings: {
-        type: 'array',
-        description: '必须覆盖候选清单里每个 id, 漏评的按向量分兜底。',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            id: { type: 'string', description: '候选条目 id, 原样复制。' },
-            score: { type: 'number', description: '0..1 用处分; 用相对排序拉开档次, 不要全给同一个分。' },
-            verdict: { type: 'string', enum: ['useful', 'creative', 'neutral', 'irrelevant', 'outdated', 'wrong'], description: 'creative=非显而易见但有创意价值; wrong=内容明显错误; outdated=过时。' },
-            note: { type: 'string', description: 'verdict=wrong/outdated 时必填: 错在哪。' },
-          },
-          required: ['id', 'score', 'verdict'],
-        },
-      },
+      full_ids: { type: 'array', items: { type: 'string' }, description: '按价值从高到低的最多 3 个候选 id, 会全文注入; id 必须原样复制。' },
+      pointer_ids: { type: 'array', items: { type: 'string' }, description: '次优最多 2 个候选 id, 只注入一行指针; 没有就传空数组。' },
     },
-    required: ['ratings'],
+    required: ['full_ids', 'pointer_ids'],
   },
 };
 
@@ -1925,11 +1993,12 @@ function precisionCacheGet(key) {
   const hit = precisionCache.get(key);
   if (!hit) return null;
   if (Date.now() - hit.at > PRECISION_CACHE_TTL_MS) { precisionCache.delete(key); return null; }
-  return hit.ratings;
+  const v = hit.selection;
+  return (v && Array.isArray(v.full_ids) && Array.isArray(v.pointer_ids)) ? v : null;
 }
-function precisionCacheSet(key, ratings) {
+function precisionCacheSet(key, selection) {
   if (precisionCache.size >= PRECISION_CACHE_MAX) precisionCache.delete(precisionCache.keys().next().value);
-  precisionCache.set(key, { at: Date.now(), ratings });
+  precisionCache.set(key, { at: Date.now(), selection });
 }
 function precisionLog(rec) {
   const path = join(dshHome(), PRECISION_LOG_NAME);
@@ -1945,23 +2014,30 @@ function precisionLog(rec) {
   })();
 }
 
-/** recap 同款打分请求: 单条消息里带主会话最近上下文(与 recap 取数一致)+候选+rubric。 */
+/** 注入前选择请求: 单条消息 + 最近上下文 + 候选 id/摘要; 只让模型回选中的 id。 */
 function precisionPrompt(agent, key, query, candidates) {
   const ts = turnState.get(key);
   const user = String((ts && ts.lastUserText) || query || '');
   const asst = lastAssistantTail(agent, RECAP_ASST_SNIPPET);
-  // 直接复用 recap 的 prompt 生成器: 模型已在轮末验证过这个形态的工具调用。
-  const items = candidates.map((it) => ({
-    id: String(it.id || ''),
-    score: it.score,
-    content: truncate(String(it.content || ''), PRECISION_REVIEW_CHARS),
-  }));
-  return recapPrompt(user, asst, key, { items }) + [
+  const recap = String(recapBuf.get(key) || '').slice(-RECAP_QUERY_CHARS);
+  const lines = [
+    '[nebula 注入前精排] 这是主请求前的辅助选择, 不属于主对话; 输出用户看不到, 也不会写入会话。',
+    '唯一动作: 调用工具 nebula_recap_return 一次。不要输出正文, 不要调用其他工具。',
+    '参数只有两个数组: full_ids = 按价值从高到低最多 3 个候选 id (全文注入); pointer_ids = 次优最多 2 个候选 id (只留一行指针); 没选中的不要列出; 没有次优条目时 pointer_ids 传空数组。',
+    '调用示例: nebula_recap_return({"full_ids":["<候选id1>","<候选id2>","<候选id3>"],"pointer_ids":["<候选id4>","<候选id5>"]})',
+    'id 必须从下方候选清单里原样复制; 不要给分数、不要写理由、不要写总结。',
+    '选择标准: 真正帮得上当前用户消息的条目优先; 创意/新颖的非显而易见联想也算高价值; 明显错误或过时的不要选。',
     '',
-    '[补充评分要求]',
-    '- 创意任务: 新颖度、风格跨度、非显而易见的联想算高价值; 不因与 prompt 字面或当前方向不同而扣分。',
-    '- 用相对排序拉开档次, 不要全给同一个分。',
-  ].join('\n');
+    '【当前用户消息】' + user,
+  ];
+  if (asst) lines.push('【上一轮助手回答(尾部)】' + asst);
+  if (recap) lines.push('【上一轮话题】' + recap);
+  lines.push('', '【候选记忆 — id 原样复制】');
+  for (const it of candidates) {
+    const sc = typeof it.score === 'number' ? it.score.toFixed(2) : '?';
+    lines.push('- ' + String(it.id || '') + ' [相关度 ' + sc + '] ' + truncate(String(it.content || ''), PRECISION_REVIEW_CHARS));
+  }
+  return lines.join('\n');
 }
 
 /** 沿用主会话的 provider/model(与前台请求完全一致), 不引入额外模型路由。 */
@@ -1980,7 +2056,31 @@ async function resolvePrecisionRoute(agent) {
   return route;
 }
 
-/** 复刻主会话上下文 + 一次结构化打分调用; 失败/超时/截断一律返回 null 让调用方回退。 */
+/** 严格校验选择结果: 非法/重复 id 丢弃, 顺序保留, 空选择视为失败。导出供自检。 */
+export function normalizePrecisionSelection(parsed, validIds) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (!Array.isArray(parsed.full_ids) || !Array.isArray(parsed.pointer_ids)) return null; // 字段缺失/类型错误才算失败
+  const valid = validIds instanceof Set ? validIds : new Set(validIds || []);
+  const seen = new Set();
+  const pick = (v, limit) => {
+    const out = [];
+    if (!Array.isArray(v)) return out;
+    for (const raw of v) {
+      const id = String(raw || '').trim();
+      if (!valid.has(id) || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+      if (out.length >= limit) break;
+    }
+    return out;
+  };
+  const full_ids = pick(parsed.full_ids, PRECISION_TOP_FULL);
+  const pointer_ids = pick(parsed.pointer_ids, PRECISION_TOP_POINTER);
+  // 两个数组都合法但都为空 = 模型认为本轮没有相关记忆, 是有效结果, 不再重试。
+  return { full_ids, pointer_ids };
+}
+
+/** 单条消息调用 + 结构化 ID 选择; 解析失败重试(不携带失败输出); 共享总预算, 全失败回退。 */
 async function precisionScore(ctx, agent, candidates, query, signal, route, budgetMs = PRECISION_BUDGET_MS) {
   const llm = ctx && (ctx.llm || (typeof ctx.get === 'function' ? ctx.get('llm') : undefined));
   if (!llm || typeof llm.stream !== 'function' || !route) { precisionFailReason = 'no-llm-or-route'; return null; }
@@ -1989,39 +2089,69 @@ async function precisionScore(ctx, agent, candidates, query, signal, route, budg
   if (signal) { if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true }); }
   const timer = setTimeout(abort, budgetMs);
   const started = Date.now();
+  const validIds = new Set(candidates.map((it) => String(it.id || '')));
+  const attempts = 1 + PRECISION_RETRIES;
+  let lastFail = '';
   try {
-    // 与 recap 完全同款: 单条用户消息调用, 不复制会话历史、不改历史消息。
+    // 每次尝试都是全新的单条消息调用, 不把失败那次的输出带进上下文。
     const messages = [{ role: 'user', content: [{ type: 'text', text: precisionPrompt(agent, agent.session.id, query, candidates) }] }];
-    let toolName = '';
-    let args = '';
-    let finish = '';
-    for await (const chunk of llm.stream({
-      provider: route.provider,
-      model: route.model,
-      messages,
-      tools: [RECAP_RETURN_SCHEMA], // 直接用 recap 同款工具 schema, 保持与主模型已验证的调用形态一致
-      maxTokens: PRECISION_MAX_TOKENS,
-      sessionId: agent.session.id,
-      purpose: 'nebula-precision',
-      signal: controller.signal,
-    })) {
-      if (signal && signal.aborted) { precisionFailReason = 'aborted'; return null; }
-      if (chunk.type === 'tool-call-delta') {
-        if (chunk.name) toolName = chunk.name;
-        if (chunk.argumentsDelta) args += chunk.argumentsDelta;
-      } else if (chunk.type === 'finish') {
-        finish = String(chunk.reason?.kind || '');
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (controller.signal.aborted || (signal && signal.aborted)) { precisionFailReason = 'aborted'; return null; }
+      let toolName = '';
+      let args = '';
+      let finish = '';
+      let strayText = '';
+      for await (const chunk of llm.stream({
+        provider: route.provider,
+        model: route.model,
+        messages,
+        tools: [PRECISION_SCORE_SCHEMA],
+        maxTokens: PRECISION_MAX_TOKENS,
+        reasoningEffort: 'off',
+        sessionId: agent.session.id,
+        purpose: 'nebula-precision',
+        signal: controller.signal,
+      })) {
+        if (signal && signal.aborted) { precisionFailReason = 'aborted'; return null; }
+        if (chunk.type === 'tool-call-delta') {
+          if (chunk.name) toolName = chunk.name;
+          if (chunk.argumentsDelta) args += chunk.argumentsDelta;
+        } else if (chunk.type === 'text-delta' && chunk.text) {
+          strayText += chunk.text;
+        } else if (chunk.type === 'finish') {
+          finish = String(chunk.reason?.kind || '');
+        }
       }
+      if (controller.signal.aborted) { precisionFailReason = 'aborted'; return null; }
+      if (toolName.indexOf('recap') === -1 && toolName.indexOf('precision') === -1) {
+        lastFail = 'no-tool-call:' + (toolName || 'none') + '/finish=' + finish + '/args=' + args.length;
+        __nebTrace('precision attempt ' + attempt + '/' + attempts + ' failed: ' + lastFail + '/text=' + strayText.slice(0, 300).replace(/\n/g, ' '));
+        recapLog('info', 'precision attempt ' + attempt + '/' + attempts + ' failed: ' + lastFail + '/text=' + strayText.slice(0, 200).replace(/\n/g, ' '));
+        continue;
+      }
+      let parsed;
+      try { parsed = JSON.parse(args || '{}'); } catch (e) {
+        lastFail = 'bad-json:' + (e instanceof Error ? e.message : String(e)) + '/args=' + args.length + '/' + args.slice(0, 80);
+        __nebTrace('precision attempt ' + attempt + '/' + attempts + ' failed: ' + lastFail);
+        recapLog('info', 'precision attempt ' + attempt + '/' + attempts + ' failed: ' + lastFail);
+        continue;
+      }
+      const selection = normalizePrecisionSelection(parsed, validIds);
+      if (!selection) {
+        lastFail = 'no-valid-ids:' + JSON.stringify(parsed).slice(0, 120);
+        __nebTrace('precision attempt ' + attempt + '/' + attempts + ' failed: ' + lastFail);
+        recapLog('info', 'precision attempt ' + attempt + '/' + attempts + ' failed: ' + lastFail);
+        continue;
+      }
+      precisionFailReason = '';
+      __nebTrace('precision selected attempt=' + attempt + '/' + attempts + ' ' + (Date.now() - started) + 'ms full=' + selection.full_ids.length + ' ptr=' + selection.pointer_ids.length);
+      recapLog('info', 'precision selected attempt=' + attempt + '/' + attempts + ' ' + (Date.now() - started) + 'ms full=' + selection.full_ids.length + ' ptr=' + selection.pointer_ids.length);
+      return { ...selection, attempts: attempt };
     }
-    // max-tokens 不一律弃用: 工具参数若已完整交回就用它(recap 同款抢救逻辑)。
-    if (toolName.indexOf('recap') === -1 && toolName.indexOf('precision') === -1) { precisionFailReason = 'no-tool-call:' + (toolName || 'none') + '/finish=' + finish + '/args=' + args.length; return null; }
-    let parsed;
-    try { parsed = JSON.parse(args || '{}'); } catch (e) { precisionFailReason = 'bad-json:' + (e instanceof Error ? e.message : String(e)) + '/finish=' + finish + '/args=' + args.length + '/' + args.slice(0, 100); return null; }
-    const ratings = Array.isArray(parsed.ratings) ? parsed.ratings : null;
-    if (!ratings) { precisionFailReason = 'no-ratings'; return null; }
-    precisionFailReason = '';
-    __nebTrace('precision scored ' + (Date.now() - started) + 'ms n=' + (ratings ? ratings.length : 0));
-    return ratings;
+    precisionFailReason = lastFail + '/attempts=' + attempts;
+    __nebTrace('precision failed: ' + precisionFailReason);
+    recapLog('warn', 'precision failed: ' + precisionFailReason);
+    return null;
   } catch (error) {
     precisionFailReason = 'error:' + (error instanceof Error ? error.message : String(error));
     __nebTrace('precision failed: ' + precisionFailReason);
@@ -2031,42 +2161,20 @@ async function precisionScore(ctx, agent, candidates, query, signal, route, budg
   }
 }
 
-/** 严格校验 + 相对排序 top-K; verdict=wrong/outdated 硬淘汰。 */
-function applyPrecision(candidates, ratings) {
-  const valid = new Map(candidates.map((it) => [String(it.id || ''), it]));
-  const byId = new Map();
-  for (const r of ratings.slice(0, PRECISION_CANDIDATES + 4)) {
-    const id = String((r && r.id) || '');
-    const raw = r && r.score;
-    if (!valid.has(id) || byId.has(id) || typeof raw !== 'number' || !Number.isFinite(raw)) continue;
-    byId.set(id, {
-      score: Math.max(0, Math.min(1, raw)),
-      verdict: String((r && r.verdict) || ''),
-      note: String((r && r.note) || '').slice(0, 200),
-    });
-  }
-  const out = candidates.map((it) => {
-    const id = String(it.id || '');
-    const v = byId.get(id);
-    return {
-      ...it,
-      precisionScore: v ? v.score : (typeof it.score === 'number' ? it.score : 0),
-      precisionVerdict: v ? v.verdict : 'unrated',
-      precisionNote: v ? v.note : '',
-    };
-  }).filter((it) => !PRECISION_DROP_VERDICTS.has(it.precisionVerdict))
-    .sort((a, b) => b.precisionScore - a.precisionScore || (b.score || 0) - (a.score || 0));
-  // 逐条审计: 含被硬淘汰的条目, 便于看分数分布和丢弃原因。
-  const scores = candidates.map((it) => {
-    const id = String(it.id || '');
-    const v = byId.get(id);
-    return { id, score: v ? v.score : null, verdict: v ? v.verdict : 'unrated', note: v ? v.note : '' };
-  });
-  return {
-    full: out.slice(0, PRECISION_TOP_FULL),
-    pointers: out.slice(PRECISION_TOP_FULL, PRECISION_TOP_FULL + PRECISION_TOP_POINTER),
-    scores,
-  };
+/** 按模型给出的有序 id 取全文/指针; 没列出的条目即淘汰。 */
+function applyPrecision(candidates, selection) {
+  const byId = new Map(candidates.map((it) => [String(it.id || ''), it]));
+  const picked = (ids) => ids.map((id) => byId.get(id)).filter(Boolean).map((it) => ({ ...it, precisionSelected: true }));
+  const tier = new Map();
+  for (const id of selection.full_ids) tier.set(id, 'selected-full');
+  for (const id of selection.pointer_ids) if (!tier.has(id)) tier.set(id, 'selected-pointer');
+  const scores = candidates.map((it) => ({
+    id: String(it.id || ''),
+    score: null,
+    verdict: tier.get(String(it.id || '')) || 'not-selected',
+    note: '',
+  }));
+  return { full: picked(selection.full_ids), pointers: picked(selection.pointer_ids), scores };
 }
 
 /** 打分不可用时按原向量分 top-K —— 行为与旧版一致, 保证零回归。 */
@@ -2126,6 +2234,7 @@ export function apply(ctx) {
     if (prev && prev.agent === agent) return;
     if (prev) { agentDisposers.delete(key); try { prev.dispose(); } catch {} }
     turnState.set(key, { firstTurnAt: Date.now(), turnCount: 0, lastSourceWasUser: false, lastUserText: '', intraRecallCount: 0, intraSigs: new Set() });
+    restoreRecapFromDisk(key);
 
     /** v1.5.0: 工具报错后本轮重新召回 —— 换掉两腿, 本 step 不注入, 由下一 step 用新 st 注入。 */
     const maybeIntraTurnRecall = (payload) => {
@@ -2234,26 +2343,37 @@ export function apply(ctx) {
       let kept = candidates.slice(0, PREFETCH_LIMIT); // 默认: 向量分 top-K (精排未启用/候选不足)
       let memPointers = [];
       let precisionSource = 'off';
-      if (PRECISION_ENABLED && candidates.length > PRECISION_TOP_FULL && !(payload.signal && payload.signal.aborted)) {
+      // 新会话首轮没有上一轮回答/recap 作依据, 直接走向量 top-K (反馈仍由轮末 recap 正常记录)
+      const ts = turnState.get(key);
+      const firstPrompt = (!ts || (ts.turnCount || 0) === 0) && !hasPriorConversation(agent);
+      const skipPrecision = PRECISION_SKIP_FIRST_TURN && firstPrompt;
+      if (PRECISION_ENABLED && skipPrecision && candidates.length > PRECISION_TOP_FULL) {
+        __nebTrace('precision skipped: first prompt of session key=' + key);
+      }
+      if (PRECISION_ENABLED && !skipPrecision && candidates.length > PRECISION_TOP_FULL && !(payload.signal && payload.signal.aborted)) {
         const route = await resolvePrecisionRoute(agent);
         const cacheKey = precisionCacheKey(st.text, candidates);
-        let ratings = precisionCacheGet(cacheKey);
-        if (ratings) {
+        let selection = precisionCacheGet(cacheKey);
+        let attempts = 0;
+        if (selection) {
           precisionSource = 'cache';
         } else {
           precisionFailReason = '';
-          ratings = await precisionScore(ctx, agent, candidates, st.text, payload.signal, route);
-          if (ratings) { precisionCacheSet(cacheKey, ratings); precisionSource = 'scored-recap'; }
-          else precisionSource = 'fallback';
+          selection = await precisionScore(ctx, agent, candidates, st.text, payload.signal, route);
+          if (selection) {
+            precisionCacheSet(cacheKey, selection);
+            precisionSource = 'selected-ids';
+            attempts = selection.attempts || 0;
+          } else precisionSource = 'fallback';
         }
         let auditScores = [];
-        if (ratings) {
-          const picked = applyPrecision(candidates, ratings);
+        if (selection) {
+          const picked = applyPrecision(candidates, selection);
           kept = picked.full;
           memPointers = picked.pointers;
           auditScores = picked.scores;
         } else {
-          const fb = fallbackPrecision(candidates); // 失败/超时/截断 → 原行为, 零回归
+          const fb = fallbackPrecision(candidates); // 全失败 → 原向量分 top-3, 零回归
           kept = fb.full;
           auditScores = fb.scores;
         }
@@ -2263,7 +2383,8 @@ export function apply(ctx) {
           candidates: candidates.length,
           kept: kept.map((it) => String(it.id || '')),
           pointers: memPointers.map((it) => String(it.id || '')),
-          scores: auditScores, // 逐条 score/verdict/note, 仅本地审计, 不回写星云
+          scores: auditScores, // 逐条 verdict=selected-full/selected-pointer/not-selected, 仅本地审计
+          attempts,
           model: route ? route.provider + '/' + route.model : '',
           fail: precisionFailReason || undefined,
         });

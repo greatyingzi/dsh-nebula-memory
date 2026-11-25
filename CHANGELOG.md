@@ -6,6 +6,139 @@
 
 ---
 
+## [1.6.8] — 2026-11-25
+
+### Fixed — 落盘产物容量护栏
+
+- **压缩交接文件**：`nebula-compaction-handoff-session-*.json` 原先只增不删（随会话数/压缩次数无限膨胀）。现在每次写入后按**数量上限 20 个 + 时间上限 7 天**双条件清理，保留最新一份。
+- **recap 本地缓存**：写入时先剔除超过 7 天的条目，再按 100 个会话上限淘汰，避免仅靠"读取时判过期"留下僵尸条目。
+- 其余审计/队列产物原本就有边界：精排与反馈日志各保留 3000 行、outbox 上限 200 条且 7 天 TTL、dropped 日志 200 行、进程内缓存 200 条。
+
+### 升级影响
+
+- 旧的交接文件在下次压缩写入时才会被清理；当前 7 个都未超 7 天，不会删除。
+- 需重启宿主加载新代码。
+
+---
+
+## [1.6.7] — 2026-11-25
+
+### Fixed — 重启后旧会话 recap 丢失 + 合法空选择被误判失败
+
+- **recap 本地持久缓存**：轮末总结除入队星云外，同时写入 `~/.dsh/nebula-recap-cache.json`（按会话 ID 索引，最多 100 个会话、7 天有效）。插件加载 / `agent/created` 时按会话 ID 回填 `recapBuf` / `pendingRecall` / `recapQueryTail`，于是服务重启后的第一条"继续"也能拼回上一轮 recap 并做查询增强。星云上传失败或滞后不再影响恢复。
+- **空选择合法化**：模型返回 `{"full_ids":[],"pointer_ids":[]}` 表示本轮没有相关记忆，现在视为有效结果（不再触发重试）。只有字段缺失/类型错误才算失败并重试。
+
+### 升级影响
+
+- 新增本地文件 `~/.dsh/nebula-recap-cache.json`；旧的 recap 只在下一次轮末总结后才写入缓存。
+- 需重启宿主加载新代码；重启后 web.log 应出现 `[nebula-recap] recap restored from disk key=...`。
+
+---
+
+## [1.6.6] — 2026-11-25
+
+### Fixed — outbox 写失败导致召回读空转
+
+- trace 实证：outbox 批量上传持续 `This operation was aborted`，`noteRoute` 把两条路由都打入 30s 冷却；`recallMemLeg` / `recallSessionLeg` 发现"全部冷却"后直接返回空，连 `api GET /api/memories/search` 都不发（`memReady=true(0)`），精排因候选不足永远不触发。
+- 读召回不再因冷却提前返回：冷却路由仍排在后面尝试，由请求预算兜底；写队列继续沿用冷却逻辑跳过失败路由。读写故障域解耦。
+
+### 升级影响
+
+- 路由不可达时读召回可能多等一个请求预算，但不会再静默注入空结果。
+- 需重启宿主加载新代码。
+
+---
+
+## [1.6.5] — 2026-11-25
+
+### Fixed — 精排辅助调用 maxTokens 800 触顶导致 no-tool-call
+
+- trace 实证：新契约下每次尝试都是 `no-tool-call:none/finish=max-tokens/args=0`，模型在发出工具调用前就把 800 token 用光。恢复 v1.6.1 已知可用的 `maxTokens: 4000`（输出仍由 schema 约束为两个 id 数组）。
+- 失败日志追加模型正文片段（最多 200 字写入 web.log / 300 字写入 trace），若仍不调工具可直接看到它在输出什么。
+- 首轮判定修复、工具名复用、参数样例、ID 契约与重试预算均保持不变。
+
+### 升级影响
+
+- 单次尝试成本略升，但工具调用成功率优先；全部失败仍回退向量 top-3。
+- 需重启宿主加载新代码。
+
+---
+
+## [1.6.4] — 2026-11-25
+
+### Fixed — 宿主重启后旧会话被误判为「新会话首轮」
+
+- 首轮判定原来只看内存中的 `turnCount === 0`；插件随宿主重启重建 `turnState`，导致旧会话重启后的第一条消息被跳过精排（trace 实证：`precision skipped: first prompt of session`，同时 `memReady=true(12)`）。
+- 现在必须同时满足 `turnCount === 0` **且** 会话日志里没有 assistant 消息、用户消息少于 2 条才算首轮。真正的新会话仍然跳过精排，旧会话重启后照常精排。
+- trace 新增跳过原因日志，方便确认。
+
+### 升级影响
+
+- 需重启宿主加载新代码；下一轮旧会话消息应出现 `source=selected-ids` 或明确的 `precision attempt` 日志。
+- 回滚：回退 v1.6.3 代码即可。
+
+---
+
+## [1.6.3] — 2026-11-25
+
+### Fixed — 精排辅助调用超时（20s abort）
+
+- **工具名复用**：回调工具名改回模型已熟悉的 `nebula_recap_return`（v1.6.2 曾改成从未使用过的 `nebula_precision_return`，疑似因此未发工具调用、输出正文耗尽 `maxTokens:800`，每次精确卡满 20s 预算后 abort）。参数契约不变，仍只有 `full_ids`/`pointer_ids`，**不兼容旧 ratings 格式**；两个字段都设为必填（没有次优条目传空数组）。
+- **prompt 明确化**：直接写"必须调用工具 + 参数样例 + id 从候选清单原样复制"，删掉"只返回 ID"的歧义措辞和残留的打分语言（"用相对排序拉开档次"）。
+- **可观测性**：每次尝试的失败原因（no-tool-call / bad-json / no-valid-ids）和成功尝试的序号、耗时都写入 web.log（`[nebula-recap] precision attempt ...`），不再只写默认关闭的 trace。解析器同时接受 recap/precision 工具名。
+- 首轮跳过、关思考、重试预算（默认 3 次重试 / 20s 共享预算）均保持不变。
+
+### 升级影响
+
+- 需重启宿主加载新代码；下一轮精排日志应出现 `source=selected-ids` 与 `精排选中` 注入标记。
+- 回滚：恢复旧工具名需回退 v1.6.2 代码；旧 ratings 格式仍不兼容。
+
+---
+
+## [1.6.2] — 2026-11-25
+
+### Changed — 精排输出契约换成「只回 ID」+ 解析失败自动重试
+
+- **新契约（不兼容旧格式）**：注入前精排回调工具 `nebula_precision_return` 只接受 `full_ids`（按价值降序，最多 3）和 `pointer_ids`（次优，最多 2）；不再接收/解析 `ratings`/`score`/`verdict`/`note`，也不再复用 recap 的总结 prompt（省掉一段 500 字总结和 outcome）。未列出的候选即淘汰，模型输出顺序即排名。
+- **自动重试**：解析失败（无工具调用 / JSON 非法 / 无有效 id）最多重试 3 次（共 4 次调用）；每次都是全新的单条消息调用，失败那次的输出不带进上下文。所有尝试共享 `precision_budget_ms` 总预算，全失败回退向量 top-3。新增 tunable `precisionRetries`（env `NEBULA_PRECISION_RETRIES`，默认 3，设 0 关闭）。
+- **输出上限**：`maxTokens` 4000 → 800，`reasoningEffort: 'off'` 保持不变。
+- **审计变化**：`nebula-precision.jsonl` 的 `source` 改为 `selected-ids`，逐条 verdict 为 `selected-full` / `selected-pointer` / `not-selected`，新增 `attempts` 字段；注入块显示 `精排选中` 而非分数。
+- 首轮跳过打分与两处关闭思考保持 v1.6.1 行为。
+
+### 升级影响
+
+- 精排质量信号从逐条分数变成有序选择；轮末 recap 不变（仍回 content/outcome/ratings 三档分数），反馈降权回路不受影响。
+- 需重启宿主加载新代码；三个 profile 依赖仍锁 `github:...@v1.6.0`，从 tag 重装会覆盖热修。
+- 回滚：旧格式不再兼容，恢复旧行为需回退 v1.6.1 代码。
+
+### 最佳配置建议
+
+- 成本/延迟敏感时 `NEBULA_PRECISION_RETRIES=1~2`；默认 3 次只在不规范输出时触发。
+- 预算保持 20s；重试共享总预算，不会无限放大延迟。
+
+---
+
+## [1.6.1] — 2026-11-25
+
+### Fixed — 辅助调用关思考 + 新会话首轮跳过注入前精排
+
+- **首轮不打分**：新会话第一轮用户消息（`turnState.turnCount === 0`，没有上一轮助手回答/recap 摘要可作打分依据）跳过注入前精排，直接沿用向量分 top-K；轮末 recap 的 ratings 真实反馈回路不变。实测首轮打分 99/305 次以 no-tool-call/超时回退，跳过省一次调用并消除首轮延迟尖峰。可用 `NEBULA_PRECISION_SKIP_FIRST_TURN=0` 恢复首轮打分。
+- **辅助调用关闭思考**：recap 总结请求与注入前打分请求都显式传 `reasoningEffort: 'off'`。两者只做结构化工具回调，不需要思维链；关闭后减少 token 与等待时间，降低预算内超时 / JSON 截断回退概率。
+- **新 tunable**：`precisionSkipFirstTurn`（默认 true，env `NEBULA_PRECISION_SKIP_FIRST_TURN`）。
+
+### 升级影响
+
+- 只有新会话首轮的注入来源从精排变为向量 top-K；后续轮次行为不变。
+- 改文件需宿主重启才加载新代码；若从 github tag 重装，需先发布 v1.6.1 或改用本地 link 安装。
+- 回滚：设 `NEBULA_PRECISION_SKIP_FIRST_TURN=0` 恢复首轮打分；恢复思考需删掉两处 `reasoningEffort: 'off'`（暂无独立开关）。
+
+### 最佳配置建议
+
+- 首轮延迟敏感场景保持默认；看重首轮注入精度可关掉跳过，同时把 `precision_budget_ms` 调大。
+- recap 想继续用便宜路由的照旧配 `recap_provider` / `recap_model`。
+
+---
+
 ## [1.6.0] — 2026-11-20
 
 ### Added — 注入前精排（fork-from-main precision rerank）
